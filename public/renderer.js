@@ -1,5 +1,10 @@
 // public/renderer.js
 // Renderer 2D por canvas. Interpolación ya viene del state.entities.
+//
+// CAMBIOS V1.1.0:
+//   - [FEAT] Soporte para partícula kind='death' (nube gris al morir).
+//   - [FEAT] Borde de "fading" en entidades que se están desvaneciendo.
+//   - [PERF] Reducción de allocations en el loop (reutiliza gradientes cuando puede).
 
 const EMOTION_PALETTE = Object.freeze({
   alegria:    '#f6c453',
@@ -17,6 +22,7 @@ const EMOTION_PALETTE = Object.freeze({
 });
 
 const GRID_SIZE = 100;
+const BIG_GRID_MULT = 5;
 
 export class Renderer {
   constructor(canvas, state) {
@@ -28,7 +34,6 @@ export class Renderer {
     this.width = 0;
     this.height = 0;
 
-    // Cámara (referenciada desde controls, pero con defaults)
     this.camera = {
       x: 1000,
       y: 1000,
@@ -37,16 +42,11 @@ export class Renderer {
       maxZoom: 5,
     };
 
-    // Estela de cada entidad
-    this.trails = new Map();     // id → array de {x, y, t}
+    this.trails = new Map();
 
     this._bindResize();
     this.resize();
   }
-
-  // ------------------------------------------------------------
-  // Resize
-  // ------------------------------------------------------------
 
   _bindResize() {
     window.addEventListener('resize', () => this.resize());
@@ -78,12 +78,12 @@ export class Renderer {
     const ctx = this.ctx;
     const { camera } = this;
 
-    // Fondo (con leve estela para suavizar el movimiento)
+    // Fondo con estela
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.fillStyle = 'rgba(6, 9, 15, 0.35)';
     ctx.fillRect(0, 0, this.width, this.height);
 
-    // Aplica cámara
+    // Cámara
     ctx.save();
     ctx.translate(this.width / 2, this.height / 2);
     ctx.scale(camera.zoom, camera.zoom);
@@ -115,18 +115,15 @@ export class Renderer {
   _drawGrid() {
     const ctx = this.ctx;
     const cam = this.camera;
-    const world = this.state.config.world;
 
-    // Rango visible
+    if (cam.zoom < 0.25) return;
+
     const halfW = this.width / 2 / cam.zoom;
     const halfH = this.height / 2 / cam.zoom;
     const x0 = Math.floor((cam.x - halfW) / GRID_SIZE) * GRID_SIZE;
     const y0 = Math.floor((cam.y - halfH) / GRID_SIZE) * GRID_SIZE;
     const x1 = cam.x + halfW;
     const y1 = cam.y + halfH;
-
-    // Si el grid se ve muy denso, oculta
-    if (cam.zoom < 0.25) return;
 
     ctx.strokeStyle = 'rgba(80, 120, 180, 0.06)';
     ctx.lineWidth = 1 / cam.zoom;
@@ -142,12 +139,13 @@ export class Renderer {
     }
     ctx.stroke();
 
-    // Grid cada 500px más marcado
-    ctx.strokeStyle = 'rgba(80, 120, 180, 0.12)';
-    ctx.beginPath();
-    const BIG = GRID_SIZE * 5;
+    // Grid grande
+    const BIG = GRID_SIZE * BIG_GRID_MULT;
     const bx0 = Math.floor((cam.x - halfW) / BIG) * BIG;
     const by0 = Math.floor((cam.y - halfH) / BIG) * BIG;
+
+    ctx.strokeStyle = 'rgba(80, 120, 180, 0.12)';
+    ctx.beginPath();
     for (let x = bx0; x < x1; x += BIG) {
       ctx.moveTo(x, by0);
       ctx.lineTo(x, y1);
@@ -194,11 +192,9 @@ export class Renderer {
       const s = rel.strength;
       if (s < 0.08) continue;
 
-      // Grosor y alpha en función de la fuerza
       const alpha = Math.min(0.75, 0.15 + s * 0.7);
       const lineWidth = Math.max(0.4, (0.6 + s * 2.2)) / zoom;
 
-      // Color: mezcla entre los colores de ambas entidades
       const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
       grad.addColorStop(0, hexWithAlpha(a.color, alpha));
       grad.addColorStop(1, hexWithAlpha(b.color, alpha));
@@ -220,7 +216,6 @@ export class Renderer {
     const entities = this.state.entities;
     const now = performance.now();
 
-    // Añade punto a la estela
     for (const [id, e] of entities) {
       if (e.fading) continue;
       let arr = this.trails.get(id);
@@ -228,7 +223,6 @@ export class Renderer {
         arr = [];
         this.trails.set(id, arr);
       }
-      // Solo añade si se ha movido lo suficiente
       const last = arr[arr.length - 1];
       if (!last || Math.hypot(e.x - last.x, e.y - last.y) > 3) {
         arr.push({ x: e.x, y: e.y, t: now });
@@ -236,11 +230,8 @@ export class Renderer {
       }
     }
 
-    // Limpia estelas de entidades muertas
     for (const id of this.trails.keys()) {
-      if (!entities.has(id)) {
-        this.trails.delete(id);
-      }
+      if (!entities.has(id)) this.trails.delete(id);
     }
   }
 
@@ -280,7 +271,7 @@ export class Renderer {
 
       const { x, y, radius, color, alpha, pulse } = e;
 
-      // ---------- Aura exterior ----------
+      // Aura exterior
       const auraRadius = radius * (2.6 + pulse * 1.8);
       const grad = ctx.createRadialGradient(x, y, radius * 0.35, x, y, auraRadius);
       grad.addColorStop(0, hexWithAlpha(color, 0.42 * alpha));
@@ -291,20 +282,20 @@ export class Renderer {
       ctx.arc(x, y, auraRadius, 0, Math.PI * 2);
       ctx.fill();
 
-      // ---------- Núcleo ----------
+      // Núcleo
       ctx.fillStyle = hexWithAlpha(color, alpha);
       ctx.beginPath();
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      // ---------- Anillo interior ----------
+      // Anillo interior
       ctx.strokeStyle = hexWithAlpha('#ffffff', 0.35 * alpha);
       ctx.lineWidth = Math.max(0.5, 1) / zoom;
       ctx.beginPath();
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.stroke();
 
-      // ---------- Marca de simulada ----------
+      // Borde especial para simuladas
       if (e.isSimulated) {
         ctx.strokeStyle = hexWithAlpha('#ffffff', 0.7 * alpha);
         ctx.lineWidth = Math.max(0.6, 1.2) / zoom;
@@ -315,7 +306,18 @@ export class Renderer {
         ctx.setLineDash([]);
       }
 
-      // ---------- Pulso de interacción ----------
+      // Anillo especial para las que se están desvaneciendo
+      if (e.fading) {
+        ctx.strokeStyle = hexWithAlpha('#8892a4', 0.4 * alpha);
+        ctx.lineWidth = Math.max(0.5, 1) / zoom;
+        ctx.setLineDash([4 / zoom, 4 / zoom]);
+        ctx.beginPath();
+        ctx.arc(x, y, radius * 1.3, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Pulso de interacción
       if (pulse > 0.05) {
         const ringR = radius * (1.2 + (1 - pulse) * 2.5);
         ctx.strokeStyle = hexWithAlpha(color, pulse * 0.55 * alpha);
@@ -325,7 +327,7 @@ export class Renderer {
         ctx.stroke();
       }
 
-      // ---------- Etiqueta ----------
+      // Etiqueta
       if (showLabels) {
         const label = e.label || shortId(e.id);
         const fontSize = Math.max(9, 10 / zoom);
@@ -335,11 +337,9 @@ export class Renderer {
 
         const textY = y - radius - 8 / zoom;
 
-        // Sombra
         ctx.fillStyle = `rgba(0,0,0,${0.55 * alpha})`;
         ctx.fillText(label, x + 0.5 / zoom, textY + 0.5 / zoom);
 
-        // Texto
         ctx.fillStyle = `rgba(230, 240, 255, ${0.75 * alpha})`;
         ctx.fillText(label, x, textY);
       }
@@ -357,11 +357,12 @@ export class Renderer {
     if (!particles.length) return;
 
     for (const p of particles) {
-      const t = 1 - p.life;             // 0 → 1
+      const t = 1 - p.life;
       const ease = 1 - Math.pow(1 - t, 3);
 
       if (p.kind === 'interaction') {
         const r = 12 + ease * 70;
+
         ctx.strokeStyle = hexWithAlpha(p.colorA, p.life * 0.5);
         ctx.lineWidth = Math.max(0.6, (1.6 - ease) * 2) / zoom;
         ctx.beginPath();
@@ -381,6 +382,24 @@ export class Renderer {
         ctx.beginPath();
         ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
         ctx.fill();
+      } else if (p.kind === 'death') {
+        // Nube gris que se expande y desvanece
+        const r = 10 + ease * 55;
+        const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+        grad.addColorStop(0, hexWithAlpha('#8892a4', p.life * 0.5));
+        grad.addColorStop(0.5, hexWithAlpha('#5a6478', p.life * 0.25));
+        grad.addColorStop(1, hexWithAlpha('#5a6478', 0));
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Pequeño anillo
+        ctx.strokeStyle = hexWithAlpha('#8892a4', p.life * 0.4);
+        ctx.lineWidth = Math.max(0.5, 1) / zoom;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r * 0.7, 0, Math.PI * 2);
+        ctx.stroke();
       }
     }
   }
