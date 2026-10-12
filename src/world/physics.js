@@ -1,0 +1,121 @@
+// src/world/physics.js
+// Utilidades de física reutilizables. Sin estado.
+
+/**
+ * Wander browniano suave: añade una fuerza aleatoria pequeña a la velocidad.
+ */
+export function applyWander(entity, dt, strength) {
+  entity.vx += (Math.random() - 0.5) * strength * dt;
+  entity.vy += (Math.random() - 0.5) * strength * dt;
+}
+
+/**
+ * Fricción: reduce la velocidad proporcionalmente.
+ */
+export function applyFriction(entity, friction) {
+  entity.vx *= friction;
+  entity.vy *= friction;
+}
+
+/**
+ * Aplica una fuerza de atracción hacia un punto.
+ * @returns true si se aplicó (dist > minDist)
+ */
+export function attractTowards(entity, targetX, targetY, strength, dt, minDist = 0) {
+  const dx = targetX - entity.x;
+  const dy = targetY - entity.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1e-6 || dist < minDist) return false;
+  const force = strength * dt;
+  entity.vx += (dx / dist) * force;
+  entity.vy += (dy / dist) * force;
+  return true;
+}
+
+/**
+ * Aplica una fuerza de repulsión desde un punto.
+ */
+export function repelFrom(entity, srcX, srcY, strength, dt, minDist = 0) {
+  const dx = entity.x - srcX;
+  const dy = entity.y - srcY;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1e-6 || dist < minDist) return false;
+  const force = strength * dt;
+  entity.vx += (dx / dist) * force;
+  entity.vy += (dy / dist) * force;
+  return true;
+}
+
+/**
+ * Limita la velocidad a un máximo.
+ */
+export function clampVelocity(entity, maxVelocity) {
+  const speed = Math.hypot(entity.vx, entity.vy);
+  if (speed > maxVelocity && speed > 1e-6) {
+    const k = maxVelocity / speed;
+    entity.vx *= k;
+    entity.vy *= k;
+  }
+}
+
+/**
+ * Aplica fuerzas de borde para que las entidades no se peguen a los límites.
+ * Usa un "soft push" cuadrático en lugar de un rebote duro.
+ */
+export function applyBoundaries(entity, world) {
+  const { width, height, margin } = world;
+  const softZone = Math.max(20, margin * 0.5);
+
+  if (entity.x < margin) {
+    const d = margin - entity.x;
+    entity.vx += (d / softZone) * 0.5;
+  } else if (entity.x > width - margin) {
+    const d = entity.x - (width - margin);
+    entity.vx -= (d / softZone) * 0.5;
+  }
+
+  if (entity.y < margin) {
+    const d = margin - entity.y;
+    entity.vy += (d / softZone) * 0.5;
+  } else if (entity.y > height - margin) {
+    const d = entity.y - (height - margin);
+    entity.vy -= (d / softZone) * 0.5;
+  }
+
+  // Hard clamp para que nunca salga
+  entity.x = Math.max(0, Math.min(width, entity.x));
+  entity.y = Math.max(0, Math.min(height, entity.y));
+}
+
+/**
+ * Integra la velocidad en la posición.
+ */
+export function integrate(entity, dt) {
+  entity.x += entity.vx * dt;
+  entity.y += entity.vy * dt;
+}
+
+/**
+ * Distancia euclídea al cuadrado (más rápido, sin sqrt).
+ */
+export function distSq(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+/**
+ * Distancia euclídea.
+ */
+export function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+/**
+ * Normaliza un ángulo a [-PI, PI].
+ */
+export function normalizeAngle(a) {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
+}
