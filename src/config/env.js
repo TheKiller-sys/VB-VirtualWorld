@@ -1,11 +1,9 @@
 // src/config/env.js
 // Carga y valida variables de entorno. Falla temprano si falta algo crítico.
 //
-// CAMBIOS V1.3.0:
-//   - [FIX] communityProtocol: ahora usa CEREBRO_PEER_TOKEN (no admin token)
-//     porque el endpoint real es POST /api/peer/inbox que requiere peer token.
-//   - [FEAT] WORLD_PEER_ID: identificador estable del mundo ante el Cerebro.
-//   - [FEAT] COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS: polling de respuestas.
+// CAMBIOS V1.5.0:
+//   - [PERF] wsBroadcastHz por defecto sube de 15 a 30.
+//   - [FEAT] wsFullSnapshotIntervalMs: cada cuánto se manda un snapshot completo.
 
 import 'dotenv/config';
 
@@ -81,25 +79,11 @@ export const env = {
   llmDialogueMaxLines: toInt(process.env.LLM_DIALOGUE_MAX_LINES, 3),
 
   // ---------- communityProtocol ----------
-  // Habilita el envío de encuentros al Cerebro
   communityProtocolEnabled: toBool(process.env.COMMUNITY_PROTOCOL_ENABLED, false),
-
-  // Intervalo entre envíos al Cerebro (evita saturar)
   communityProtocolMinIntervalMs: toInt(process.env.COMMUNITY_PROTOCOL_MIN_INTERVAL_MS, 15000),
-
-  // Tipo de mensaje por defecto (debe ser uno de los válidos del CommunityProtocol)
-  // Válidos: hello, signature, shared_thought, question, answer, farewell, gift, request
   communityProtocolMessageType: process.env.COMMUNITY_PROTOCOL_MESSAGE_TYPE || 'shared_thought',
-
-  // Intervalo de polling del outbox del Cerebro (para recoger respuestas)
-  communityProtocolFetchIntervalMs: toInt(
-    process.env.COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS, 15000
-  ),
-
-  // Habilitar el polling de respuestas
-  communityProtocolFetchEnabled: toBool(
-    process.env.COMMUNITY_PROTOCOL_FETCH_ENABLED, true
-  ),
+  communityProtocolFetchEnabled: toBool(process.env.COMMUNITY_PROTOCOL_FETCH_ENABLED, true),
+  communityProtocolFetchIntervalMs: toInt(process.env.COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS, 15000),
 
   // ---------- Simulación ----------
   tickIntervalMs: toInt(process.env.TICK_INTERVAL_MS, 33),
@@ -122,7 +106,10 @@ export const env = {
 
   // ---------- WebSocket ----------
   wsMaxClients: toInt(process.env.WS_MAX_CLIENTS, 100),
-  wsBroadcastHz: toInt(process.env.WS_BROADCAST_HZ, 15),
+  // Subido de 15 → 30 para tiempo real. Solo enviamos datos ligeros.
+  wsBroadcastHz: toInt(process.env.WS_BROADCAST_HZ, 30),
+  // Cada cuánto se manda un snapshot completo (con emoción, traits, etc.)
+  wsFullSnapshotIntervalMs: toInt(process.env.WS_FULL_SNAPSHOT_INTERVAL_MS, 3000),
 
   // ---------- Persistencia ----------
   worldDbPath: process.env.WORLD_DB_PATH || './data/world.db',
@@ -161,8 +148,13 @@ if (env.llmDialogueMaxLines < 2 || env.llmDialogueMaxLines > 6) {
 if (env.communityProtocolFetchIntervalMs < 5000) {
   errors.push('COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS debe ser >= 5000.');
 }
+if (env.wsBroadcastHz < 5 || env.wsBroadcastHz > 60) {
+  errors.push('WS_BROADCAST_HZ debe estar entre 5 y 60.');
+}
+if (env.wsFullSnapshotIntervalMs < 500) {
+  errors.push('WS_FULL_SNAPSHOT_INTERVAL_MS debe ser >= 500.');
+}
 
-// Valida tipo de mensaje contra la whitelist del CommunityProtocol real
 const VALID_COMMUNITY_TYPES = new Set([
   'hello', 'signature', 'shared_thought', 'question',
   'answer', 'farewell', 'gift', 'request',
@@ -203,8 +195,7 @@ if (env.llmDialogueEnabled) {
 if (env.communityProtocolEnabled) {
   if (!env.cerebroPeerToken) {
     console.warn(
-      '⚠️  communityProtocol: ACTIVO pero CEREBRO_PEER_TOKEN no está configurado. ' +
-      'Los envíos fallarán con 401.'
+      '⚠️  communityProtocol: ACTIVO pero CEREBRO_PEER_TOKEN no está configurado.'
     );
   } else {
     console.log(
@@ -217,5 +208,10 @@ if (env.communityProtocolEnabled) {
 } else {
   console.log('ℹ️  communityProtocol: DESACTIVADO');
 }
+
+console.log(
+  `ℹ️  WebSocket: broadcast a ${env.wsBroadcastHz}Hz · ` +
+  `full snapshot cada ${env.wsFullSnapshotIntervalMs / 1000}s`
+);
 
 export default env;
