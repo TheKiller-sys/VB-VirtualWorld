@@ -1,22 +1,14 @@
 // public/world.js
 // Bootstrap del frontend de Cerebro World.
 //
-// CAMBIOS V1.3.0:
-//   - [FEAT] Handler del evento 'dialogue' → burbujas de texto.
-//   - [FEAT] Gestor de cola de diálogos por entidad.
-//   - [FEAT] Ventana global __dialogueApi para el renderer.
-//   - [SEC] Soporte de WORLD_WS_TOKEN vía ?token= o localStorage.
-//   - [FEAT] Heartbeat cliente-side para detectar conexiones muertas.
-//   - [FIX] controls.attach(renderer, camera) inyectado correctamente.
-//   - [FIX] controls.tickFollow() llamado en cada frame del loop.
+// CAMBIOS V1.5.0 (tiempo real):
+//   - [PERF] Extrapolación pura: 0ms de latencia percibida.
+//   - [FEAT] Manejo de mensajes 'tick' (light) y 'full'.
+//   - [FEAT] Server actualizado a 30Hz de broadcasts.
 
 import { Renderer } from './renderer.js';
 import { Controls } from './controls.js';
 import { Panel } from './panel.js';
-
-// ============================================================
-// Constantes
-// ============================================================
 
 const WS_TOKEN_KEY = 'cerebro-world-ws-token';
 const HEARTBEAT_INTERVAL_MS = 20000;
@@ -26,17 +18,20 @@ const RECONNECT_MAX_MS = 20000;
 const RECONNECT_JITTER_MS = 500;
 const TOAST_DURATION_MS = 3200;
 
+// Cuánto tiempo podemos extrapolar antes de congelar posición
+const MAX_EXTRAPOLATION_S = 0.5;
+
 // ============================================================
 // Estado global
 // ============================================================
 
 const state = {
-  prevSnapshot: null,
-  currSnapshot: null,
-  prevServerTime: 0,
-  currServerTime: 0,
+  // Entidades "server truth" (última info del servidor)
+  serverEntities: new Map(),
 
+  // Entidades para render (extrapoladas)
   entities: new Map(),
+
   relationships: [],
   particles: [],
 
@@ -48,7 +43,7 @@ const state = {
       attractRadius: 350,
       interactRadius: 45,
     },
-    ws: { broadcastHz: 15 },
+    ws: { broadcastHz: 30 },
     requiresWsToken: false,
     demoMode: false,
     security: {
@@ -82,6 +77,7 @@ const state = {
   wsToken: null,
   lastEventAt: 0,
   lastPongAt: 0,
+  lastFullSnapshotAt: 0,
 
   isTabVisible: true,
 };
@@ -113,10 +109,8 @@ const controls = new Controls(canvas, state, {
   onBackgroundSelected: () => panel.hide(),
 });
 
-// Inyecta renderer y camera en controls
 controls.attach(renderer, renderer.camera);
 
-// Debug
 window.__world = { state, renderer, controls, panel };
 
 // ============================================================
@@ -288,21 +282,26 @@ function promptForToken() {
 }
 
 // ============================================================
-// Manejo de mensajes del WS
+// Manejo de mensajes
 // ============================================================
 
 function handleMessage(msg) {
   switch (msg.type) {
     case 'welcome':
-      applySnapshot(msg.snapshot);
-      if (msg.serverTime) {
-        state.lastEventAt = msg.serverTime;
-      }
+      applyFullSnapshot(msg.snapshot);
       showToast('🌍 Conectado al mundo', 'success');
       break;
 
+    case 'full':
+      applyFullSnapshot(msg.snapshot);
+      if (Array.isArray(msg.events) && msg.events.length > 0) {
+        applyEvents(msg.events);
+      }
+      state.lastEventAt = Date.now();
+      break;
+
     case 'tick':
-      applySnapshot(msg.snapshot);
+      applyLightSnapshot(msg.snapshot);
       if (Array.isArray(msg.events) && msg.events.length > 0) {
         applyEvents(msg.events);
       }
@@ -310,16 +309,14 @@ function handleMessage(msg) {
       break;
 
     case 'snapshot':
-      applySnapshot(msg.snapshot);
+      applyFullSnapshot(msg.snapshot);
       break;
 
     case 'entity_created':
       if (msg.entity) {
         const isSim = msg.entity.isSimulated ? '(simulada) ' : '';
         showToast(`🌱 Nueva entidad ${isSim}${shortId(msg.entity.id)}`, 'success');
-        if (panel.currentId === msg.entity.id) {
-          panel.show(msg.entity.id);
-        }
+        if (panel.currentId === msg.entity.id) panel.show(msg.entity.id);
       }
       break;
 
@@ -338,9 +335,6 @@ function handleMessage(msg) {
       state.lastPongAt = lastPongReceivedAt;
       break;
 
-    case 'stats':
-      break;
-
     case 'error':
       showToast(`⚠️ ${msg.message || 'Error del servidor'}`, 'error');
       break;
@@ -351,23 +345,63 @@ function handleMessage(msg) {
 }
 
 // ============================================================
-// Aplicar snapshot
+// Aplicar snapshots
 // ============================================================
 
-function applySnapshot(snap) {
+/**
+ * Snapshot COMPLETO: reemplaza todo.
+ * Usado en welcome, cada 3s, y on-demand.
+ */
+function applyFullSnapshot(snap) {
   if (!snap || !Array.isArray(snap.entities)) return;
 
-  state.prevSnapshot = state.currSnapshot;
-  state.prevServerTime = state.currServerTime;
-  state.currSnapshot = snap;
-  state.currServerTime = snap.serverTime || Date.now();
+  const now = Date.now();
+  const map = new Map();
 
-  if (!state.prevSnapshot) {
-    state.prevSnapshot = state.currSnapshot;
-    state.prevServerTime = state.prevServerTime || state.currServerTime;
+  for (const e of snap.entities) {
+    map.set(e.id, {
+      ...e,
+      serverUpdatedAt: now,
+    });
   }
 
+  state.serverEntities = map;
+  state.relationships = snap.relationships || [];
+  state.lastFullSnapshotAt = now;
+
   updateHudStats(snap);
+}
+
+/**
+ * Snapshot LIGERO: solo actualiza posición y velocidad.
+ * Los demás campos (emotion, traits, etc.) se conservan del último full.
+ */
+function applyLightSnapshot(snap) {
+  if (!snap || !Array.isArray(snap.entities)) return;
+
+  const now = Date.now();
+  const map = state.serverEntities;
+  let matched = 0;
+
+  for (const light of snap.entities) {
+    const e = map.get(light.id);
+    if (!e) continue;
+
+    // Solo actualiza campos que cambian por física
+    e.x = light.x;
+    e.y = light.y;
+    e.vx = light.vx;
+    e.vy = light.vy;
+    e.alpha = light.a;
+    e.pulse = light.p;
+    e.serverUpdatedAt = now;
+    matched++;
+  }
+
+  // Actualiza HUD
+  if (snap.tick) {
+    statTick.textContent = `tick ${snap.tick}`;
+  }
 }
 
 function updateHudStats(snap) {
@@ -394,7 +428,7 @@ function updateHudStats(snap) {
     statEntities.textContent = `${state.stats.total} entidades (${real}R · ${simulated}S)`;
   }
 
-  statTick.textContent = `tick ${snap.tick || 0}`;
+  if (snap.tick) statTick.textContent = `tick ${snap.tick}`;
   statRelations.textContent = `${state.stats.relationships} relaciones · ${state.stats.strongRelationships} fuertes`;
 }
 
@@ -410,37 +444,30 @@ function applyEvents(events) {
       const p = ev.payload || {};
       state.particles.push({
         kind: 'interaction',
-        x: p.x,
-        y: p.y,
+        x: p.x, y: p.y,
         colorA: p.colorA || '#4fc3f7',
         colorB: p.colorB || '#61c9a8',
-        life: 1,
-        maxLife: 1,
+        life: 1, maxLife: 1,
         bornAt: performance.now(),
       });
     } else if (ev.type === 'entity_born') {
       const p = ev.payload || {};
       state.particles.push({
         kind: 'birth',
-        x: p.x,
-        y: p.y,
+        x: p.x, y: p.y,
         colorA: p.color || '#ffffff',
         colorB: p.color || '#ffffff',
-        life: 1,
-        maxLife: 1,
+        life: 1, maxLife: 1,
         bornAt: performance.now(),
       });
     } else if (ev.type === 'entity_died') {
-      const e = state.entities.get(ev.payload?.id);
+      const e = state.serverEntities.get(ev.payload?.id);
       if (e) {
         state.particles.push({
           kind: 'death',
-          x: e.x,
-          y: e.y,
-          colorA: '#8892a4',
-          colorB: '#8892a4',
-          life: 1,
-          maxLife: 1,
+          x: e.x, y: e.y,
+          colorA: '#8892a4', colorB: '#8892a4',
+          life: 1, maxLife: 1,
           bornAt: performance.now(),
         });
       }
@@ -466,7 +493,6 @@ function applyEvents(events) {
 
 const dialogueQueues = new Map();
 const MAX_QUEUE_PER_ENTITY = 5;
-const MAX_DIALOGUE_AGE_MS = 30000;
 
 function scheduleDialogue(messages) {
   const now = performance.now();
@@ -484,15 +510,11 @@ function scheduleDialogue(messages) {
       dialogueQueues.set(msg.entityId, queue);
     }
 
-    if (queue.length >= MAX_QUEUE_PER_ENTITY) {
-      queue.shift();
-    }
+    if (queue.length >= MAX_QUEUE_PER_ENTITY) queue.shift();
 
     queue.push({
       text: String(msg.text).slice(0, 200),
-      showAt,
-      hideAt,
-      bornAt: showAt,
+      showAt, hideAt, bornAt: showAt,
     });
   }
 }
@@ -521,13 +543,10 @@ function cleanupDialogues(now) {
     while (queue.length > 0 && queue[0].hideAt < now) {
       queue.shift();
     }
-    if (queue.length === 0) {
-      dialogueQueues.delete(id);
-    }
+    if (queue.length === 0) dialogueQueues.delete(id);
   }
 }
 
-// API global para el renderer
 window.__dialogueApi = {
   getActiveDialogue,
   getQueue: (id) => dialogueQueues.get(id) || [],
@@ -539,55 +558,40 @@ window.__dialogueApi = {
 };
 
 // ============================================================
-// Interpolación por frame
+// Extrapolación por frame (tiempo real)
 // ============================================================
 
-function interpolateEntities() {
-  const prev = state.prevSnapshot;
-  const curr = state.currSnapshot;
-  if (!curr) return;
-
-  const interval = Math.max(1, state.currServerTime - state.prevServerTime);
-  const elapsed = Date.now() - state.currServerTime;
-  let t = elapsed / interval;
-  if (t > 1.5) t = 1.5;
-  if (t < 0) t = 0;
-
-  const prevMap = new Map();
-  if (prev && Array.isArray(prev.entities)) {
-    for (const e of prev.entities) prevMap.set(e.id, e);
-  }
-
+/**
+ * En lugar de interpolar entre snapshots (que añade latencia),
+ * extrapolamos desde la última posición conocida usando la
+ * velocidad reportada por el servidor.
+ *
+ * Esto da 0ms de latencia percibida.
+ */
+function updateDisplayEntities() {
+  const now = Date.now();
   const out = new Map();
   const filters = state.filters;
+  const serverEntities = state.serverEntities;
 
-  for (const e of curr.entities) {
+  for (const e of serverEntities.values()) {
     if (!passesFilter(e, filters)) continue;
 
-    const p = prevMap.get(e.id);
-    if (!p) {
-      out.set(e.id, { ...e });
-      continue;
-    }
+    const elapsedS = (now - e.serverUpdatedAt) / 1000;
+    const capped = Math.min(Math.max(elapsedS, 0), MAX_EXTRAPOLATION_S);
 
-    const x = p.x + (e.x - p.x) * t;
-    const y = p.y + (e.y - p.y) * t;
-    const vx = p.vx + (e.vx - p.vx) * t;
-    const vy = p.vy + (e.vy - p.vy) * t;
-    const alpha = p.alpha + (e.alpha - p.alpha) * t;
-    const radius = p.radius + (e.radius - p.radius) * t;
-    const pulse = p.pulse + (e.pulse - p.pulse) * t;
+    const x = e.x + (e.vx || 0) * capped;
+    const y = e.y + (e.vy || 0) * capped;
 
-    out.set(e.id, {
-      ...e,
-      x, y, vx, vy, alpha, radius, pulse,
-    });
+    out.set(e.id, { ...e, x, y });
   }
 
   state.entities = out;
 
-  const rels = curr.relationships || [];
-  state.relationships = rels.filter(r => out.has(r.a) && out.has(r.b));
+  // Filtrar relaciones por entidades visibles
+  state.relationships = (state.relationships || []).filter(
+    r => out.has(r.a) && out.has(r.b)
+  );
 }
 
 function passesFilter(e, filters) {
@@ -613,10 +617,9 @@ function loop(now) {
     return;
   }
 
-  interpolateEntities();
+  updateDisplayEntities();
   updateParticles(dt);
 
-  // Cleanup de diálogos expirados cada 2s
   if (now - lastCleanupAt > 2000) {
     cleanupDialogues(now);
     lastCleanupAt = now;
@@ -641,9 +644,7 @@ function updateParticles(dt) {
     const p = arr[i];
     const lifespan = LIFESPANS[p.kind] || 1;
     p.life -= dt / lifespan;
-    if (p.life <= 0) {
-      arr.splice(i, 1);
-    }
+    if (p.life <= 0) arr.splice(i, 1);
   }
 }
 
@@ -694,7 +695,7 @@ function showToast(text, kind = '') {
 }
 
 // ============================================================
-// Leyenda dinámica
+// Leyenda
 // ============================================================
 
 function buildLegend() {
@@ -728,7 +729,7 @@ function buildLegend() {
 }
 
 // ============================================================
-// Carga de config inicial
+// Config inicial
 // ============================================================
 
 async function loadConfig() {
@@ -771,9 +772,7 @@ function shortId(id) {
 
 async function boot() {
   state.wsToken = loadWsToken();
-
   await loadConfig();
-
   buildLegend();
 
   if (state.config.requiresWsToken && !state.wsToken) {
@@ -789,16 +788,12 @@ async function boot() {
     'color:#4fc3f7;font-weight:bold;font-size:16px'
   );
   console.log(
-    '%cFiltros: click en leyenda · Atajos: R reset, L relaciones, N etiquetas, T estelas, F fullscreen',
-    'color:#8892a4;font-size:11px'
+    '%cReal-time: extrapolación pura · 30Hz broadcast · 0ms latencia',
+    'color:#61c9a8;font-size:11px'
   );
 }
 
 boot();
-
-// ============================================================
-// Handlers globales de error
-// ============================================================
 
 window.addEventListener('error', (e) => {
   console.error('[global] error no capturado:', e.message);
