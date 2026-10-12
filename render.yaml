@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: cerebro-world
+    runtime: docker
+    plan: standard          # free no soporta disk persistente
+    region: oregon          # ajusta a tu región
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    disk:
+      name: cerebro-world-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BFF_HOST
+        value: 0.0.0.0
+      # PORT lo inyecta Render automáticamente
+      - key: WORLD_DB_PATH
+        value: /app/data/world.db
+      - key: CEREBRO_URL
+        sync: false          # lo pones manualmente en el dashboard
+      - key: CEREBRO_ADMIN_TOKEN
+        sync: false
+      - key: WORLD_ADMIN_TOKEN
+        generateValue: true  # Render lo genera por ti
+      - key: WORLD_WS_TOKEN
+        generateValue: true
+      - key: DEMO_MODE
+        value: "false"
+      - key: LOG_LEVEL
+        value: info
+      - key: MAX_TOTAL_ENTITIES
+        value: "500"
+      - key: MAX_SIMULATED_PER_IP
+        value: "20"
