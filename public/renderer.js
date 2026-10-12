@@ -1,10 +1,10 @@
 // public/renderer.js
 // Renderer 2D por canvas. Interpolación ya viene del state.entities.
 //
-// CAMBIOS V1.1.0:
-//   - [FEAT] Soporte para partícula kind='death' (nube gris al morir).
-//   - [FEAT] Borde de "fading" en entidades que se están desvaneciendo.
-//   - [PERF] Reducción de allocations en el loop (reutiliza gradientes cuando puede).
+// CAMBIOS V1.3.0:
+//   - [FEAT] Dibujo de burbujas de diálogo sobre las entidades.
+//   - [FEAT] Soporte para partícula kind='death'.
+//   - [FEAT] Borde de "fading" en entidades desvaneciéndose.
 
 const EMOTION_PALETTE = Object.freeze({
   alegria:    '#f6c453',
@@ -78,12 +78,10 @@ export class Renderer {
     const ctx = this.ctx;
     const { camera } = this;
 
-    // Fondo con estela
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.fillStyle = 'rgba(6, 9, 15, 0.35)';
     ctx.fillRect(0, 0, this.width, this.height);
 
-    // Cámara
     ctx.save();
     ctx.translate(this.width / 2, this.height / 2);
     ctx.scale(camera.zoom, camera.zoom);
@@ -104,6 +102,11 @@ export class Renderer {
 
     this._drawEntities();
     this._drawParticles();
+
+    // Diálogos encima de todo
+    if (this.state.options.showDialogues !== false) {
+      this._drawDialogues();
+    }
 
     ctx.restore();
   }
@@ -139,7 +142,6 @@ export class Renderer {
     }
     ctx.stroke();
 
-    // Grid grande
     const BIG = GRID_SIZE * BIG_GRID_MULT;
     const bx0 = Math.floor((cam.x - halfW) / BIG) * BIG;
     const by0 = Math.floor((cam.y - halfH) / BIG) * BIG;
@@ -295,7 +297,7 @@ export class Renderer {
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Borde especial para simuladas
+      // Borde de simulada
       if (e.isSimulated) {
         ctx.strokeStyle = hexWithAlpha('#ffffff', 0.7 * alpha);
         ctx.lineWidth = Math.max(0.6, 1.2) / zoom;
@@ -306,7 +308,7 @@ export class Renderer {
         ctx.setLineDash([]);
       }
 
-      // Anillo especial para las que se están desvaneciendo
+      // Borde de fading
       if (e.fading) {
         ctx.strokeStyle = hexWithAlpha('#8892a4', 0.4 * alpha);
         ctx.lineWidth = Math.max(0.5, 1) / zoom;
@@ -347,6 +349,157 @@ export class Renderer {
   }
 
   // ------------------------------------------------------------
+  // Burbujas de diálogo
+  // ------------------------------------------------------------
+
+  _drawDialogues() {
+    const api = window.__dialogueApi;
+    if (!api) return;
+
+    const ctx = this.ctx;
+    const now = performance.now();
+    const zoom = this.camera.zoom;
+
+    if (zoom < 0.35) return;
+
+    const entities = this.state.entities;
+
+    // Ordena las entidades por Y descendente para que las burbujas
+    // de las entidades más arriba se dibujen primero
+    const sorted = Array.from(entities.values())
+      .sort((a, b) => a.y - b.y);
+
+    for (const e of sorted) {
+      if (e.alpha < 0.3) continue;
+
+      const dialogue = api.getActiveDialogue(e.id, now);
+      if (!dialogue) continue;
+
+      const age = now - dialogue.bornAt;
+      const total = dialogue.hideAt - dialogue.showAt;
+
+      let opacity = 1;
+      if (age < 200) opacity = age / 200;
+      const remaining = total - age;
+      if (remaining < 400) opacity = Math.min(opacity, remaining / 400);
+      opacity = Math.max(0, Math.min(1, opacity));
+
+      this._drawBubble(e, dialogue.text, opacity, zoom);
+    }
+  }
+
+  _drawBubble(entity, text, opacity, zoom) {
+    const ctx = this.ctx;
+    const { x, y, radius, color } = entity;
+
+    const fontSize = Math.max(10, Math.round(11 / zoom));
+    const padding = { x: 10 / zoom, y: 7 / zoom };
+    const lineHeight = fontSize * 1.35;
+    const maxWidth = 180 / zoom;
+    const cornerRadius = 8 / zoom;
+
+    ctx.font = `${fontSize}px ui-monospace, "SF Mono", Menlo, monospace`;
+
+    // Word wrap
+    const words = String(text).split(/\s+/);
+    const lines = [];
+    let currentLine = '';
+    for (const word of words) {
+      const test = currentLine ? currentLine + ' ' + word : word;
+      if (ctx.measureText(test).width > maxWidth - padding.x * 2) {
+        if (currentLine) lines.push(currentLine);
+        currentLine = word;
+      } else {
+        currentLine = test;
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+    if (lines.length === 0) lines.push(text);
+
+    let textWidth = 0;
+    for (const line of lines) {
+      const w = ctx.measureText(line).width;
+      if (w > textWidth) textWidth = w;
+    }
+
+    const boxW = textWidth + padding.x * 2;
+    const boxH = lines.length * lineHeight + padding.y * 2;
+
+    const bubbleX = x - boxW / 2;
+    const bubbleY = y - radius - boxH - 12 / zoom;
+
+    const tailSize = 5 / zoom;
+    const tailX = x;
+    const tailY = y - radius - 4 / zoom;
+
+    ctx.globalAlpha = opacity;
+
+    // Sombra
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+    ctx.shadowBlur = 12 / zoom;
+    ctx.shadowOffsetY = 2 / zoom;
+
+    // Cuerpo
+    this._roundRect(bubbleX, bubbleY, boxW, boxH, cornerRadius);
+    ctx.fillStyle = 'rgba(12, 17, 28, 0.94)';
+    ctx.fill();
+
+    // Borde
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.strokeStyle = hexWithAlpha(color, 0.55);
+    ctx.lineWidth = 1 / zoom;
+    this._roundRect(bubbleX, bubbleY, boxW, boxH, cornerRadius);
+    ctx.stroke();
+
+    // Colita
+    ctx.fillStyle = 'rgba(12, 17, 28, 0.94)';
+    ctx.beginPath();
+    ctx.moveTo(tailX - tailSize, tailY - tailSize * 0.2);
+    ctx.lineTo(tailX + tailSize, tailY - tailSize * 0.2);
+    ctx.lineTo(tailX, tailY + tailSize);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = hexWithAlpha(color, 0.55);
+    ctx.beginPath();
+    ctx.moveTo(tailX - tailSize, tailY - tailSize * 0.2);
+    ctx.lineTo(tailX, tailY + tailSize);
+    ctx.lineTo(tailX + tailSize, tailY - tailSize * 0.2);
+    ctx.stroke();
+
+    // Texto
+    ctx.fillStyle = `rgba(230, 240, 255, 0.95)`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillText(
+        lines[i],
+        bubbleX + padding.x,
+        bubbleY + padding.y + i * lineHeight,
+      );
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  _roundRect(x, y, w, h, r) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  // ------------------------------------------------------------
   // Partículas
   // ------------------------------------------------------------
 
@@ -383,7 +536,6 @@ export class Renderer {
         ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
         ctx.fill();
       } else if (p.kind === 'death') {
-        // Nube gris que se expande y desvanece
         const r = 10 + ease * 55;
         const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
         grad.addColorStop(0, hexWithAlpha('#8892a4', p.life * 0.5));
@@ -394,7 +546,6 @@ export class Renderer {
         ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
         ctx.fill();
 
-        // Pequeño anillo
         ctx.strokeStyle = hexWithAlpha('#8892a4', p.life * 0.4);
         ctx.lineWidth = Math.max(0.5, 1) / zoom;
         ctx.beginPath();
