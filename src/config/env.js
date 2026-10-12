@@ -1,7 +1,19 @@
 // src/config/env.js
 // Carga y valida variables de entorno. Falla temprano si falta algo crítico.
+//
+// CAMBIOS V1.1.1:
+//   - [FIX RENDER] El puerto lee process.env.PORT primero (Render lo inyecta),
+//     luego BFF_PORT, luego 10000 por defecto.
+//   - [SEC] Añadidas variables: MAX_TOTAL_ENTITIES, MAX_SIMULATED_PER_IP,
+//     SIMULATE_RATE_WINDOW_MS, SIMULATE_RATE_MAX.
+//   - [FIX] La validación fuerte de tokens en prod la hace server.js
+//     (validateSecurityConfig) para loguear con logger en vez de console.
 
 import 'dotenv/config';
+
+// ============================================================
+// Helpers de conversión
+// ============================================================
 
 function toInt(v, def) {
   if (v === undefined || v === null || v === '') return def;
@@ -23,36 +35,51 @@ function toBool(v, def) {
   return def;
 }
 
+// ============================================================
+// Entorno
+// ============================================================
+
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 
+// Puerto: Render inyecta PORT, en local usamos BFF_PORT.
+// Prioridad: PORT > BFF_PORT > 10000 (default de Render).
+const resolvedPort = toInt(
+  process.env.PORT,
+  toInt(process.env.BFF_PORT, 10000),
+);
+
+// ============================================================
+// Env final
+// ============================================================
+
 export const env = {
-  // Servidor
+  // ---------- Servidor ----------
   nodeEnv: NODE_ENV,
   isProd: IS_PROD,
-  port: toInt(process.env.BFF_PORT, 5000),
+  port: resolvedPort,
   host: process.env.BFF_HOST || '0.0.0.0',
   logLevel: process.env.LOG_LEVEL || (IS_PROD ? 'info' : 'debug'),
   logJson: toBool(process.env.LOG_JSON, IS_PROD),
 
-  // Cerebro
+  // ---------- Cerebro Digital ----------
   cerebroUrl: (process.env.CEREBRO_URL || 'http://localhost:3000').replace(/\/+$/, ''),
   cerebroAdminToken: process.env.CEREBRO_ADMIN_TOKEN || '',
   cerebroTimeoutMs: toInt(process.env.CEREBRO_TIMEOUT_MS, 8000),
   pollIntervalMs: toInt(process.env.POLL_INTERVAL_MS, 10000),
   pollSessionsLimit: toInt(process.env.POLL_SESSIONS_LIMIT, 200),
 
-  // Auth
+  // ---------- Autenticación del mundo ----------
   worldAdminToken: process.env.WORLD_ADMIN_TOKEN || '',
   worldWsToken: process.env.WORLD_WS_TOKEN || '',
 
-  // Seguridad y cuotas
+  // ---------- Seguridad y cuotas ----------
   maxTotalEntities: toInt(process.env.MAX_TOTAL_ENTITIES, 500),
   maxSimulatedPerIp: toInt(process.env.MAX_SIMULATED_PER_IP, 20),
   simulateRateWindowMs: toInt(process.env.SIMULATE_RATE_WINDOW_MS, 60000),
   simulateRateMax: toInt(process.env.SIMULATE_RATE_MAX, 5),
 
-  // Simulación
+  // ---------- Simulación ----------
   tickIntervalMs: toInt(process.env.TICK_INTERVAL_MS, 33),
   world: {
     width: toInt(process.env.WORLD_WIDTH, 2000),
@@ -71,27 +98,30 @@ export const env = {
     entityFadeMs: toInt(process.env.ENTITY_FADE_MS, 60000),
   },
 
-  // WebSocket
+  // ---------- WebSocket ----------
   wsMaxClients: toInt(process.env.WS_MAX_CLIENTS, 100),
   wsBroadcastHz: toInt(process.env.WS_BROADCAST_HZ, 15),
 
-  // Persistencia
+  // ---------- Persistencia ----------
   worldDbPath: process.env.WORLD_DB_PATH || './data/world.db',
   snapshotIntervalMs: toInt(process.env.SNAPSHOT_INTERVAL_MS, 60000),
   eventRetention: toInt(process.env.EVENT_RETENTION, 5000),
 
-  // Demo
+  // ---------- Demo mode ----------
   demoMode: toBool(process.env.DEMO_MODE, false),
   demoEntityCount: toInt(process.env.DEMO_ENTITY_COUNT, 12),
 
-  // Rate limiting
+  // ---------- Rate limiting global ----------
   rateLimitWindowMs: toInt(process.env.RATE_LIMIT_WINDOW_MS, 60000),
   rateLimitMax: toInt(process.env.RATE_LIMIT_MAX, 120),
 };
 
-// ---------- Validación mínima ----------
-// La validación fuerte de seguridad (tokens en prod) la hace server.js
-// en validateSecurityConfig() para poder loguear con logger en vez de console.
+// ============================================================
+// Validación mínima
+// ============================================================
+// La validación fuerte de seguridad (tokens obligatorios en prod)
+// la hace server.js en validateSecurityConfig() para poder loguear
+// con el logger en vez de con console.log directo.
 
 const errors = [];
 
@@ -104,6 +134,9 @@ if (env.maxTotalEntities < 10) {
 if (env.maxSimulatedPerIp < 1) {
   errors.push('MAX_SIMULATED_PER_IP debe ser >= 1.');
 }
+if (env.port < 1 || env.port > 65535) {
+  errors.push(`Puerto inválido: ${env.port}`);
+}
 
 if (errors.length > 0) {
   console.error('\n❌ Errores de configuración:\n');
@@ -112,15 +145,20 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-// ---------- Warnings ----------
-if (!env.isProd && !env.worldAdminToken) {
-  console.warn('⚠️ WORLD_ADMIN_TOKEN no definido (modo dev). /api/simulate está abierto.');
-}
-if (!env.isProd && !env.worldWsToken) {
-  console.warn('⚠️ WORLD_WS_TOKEN no definido (modo dev). WebSocket público.');
-}
-if (!env.cerebroAdminToken && !env.demoMode) {
-  console.warn('⚠️ CEREBRO_ADMIN_TOKEN no definido. Endpoints admin del Cerebro fallarán.');
+// ============================================================
+// Warnings (solo en dev)
+// ============================================================
+
+if (!env.isProd) {
+  if (!env.worldAdminToken) {
+    console.warn('⚠️ WORLD_ADMIN_TOKEN no definido (modo dev). /api/simulate está abierto.');
+  }
+  if (!env.worldWsToken) {
+    console.warn('⚠️ WORLD_WS_TOKEN no definido (modo dev). WebSocket público.');
+  }
+  if (!env.cerebroAdminToken && !env.demoMode) {
+    console.warn('⚠️ CEREBRO_ADMIN_TOKEN no definido. Endpoints admin del Cerebro fallarán.');
+  }
 }
 
 export default env;
