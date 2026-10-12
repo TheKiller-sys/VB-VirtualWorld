@@ -1,5 +1,9 @@
 // src/persistence/db.js
 // Conexión SQLite con WAL, migraciones y utilidades.
+//
+// CAMBIOS V1.6.0:
+//   - [FEAT] Migración v3: tabla `dialogues` para guardar los diálogos
+//     entre pares de entidades.
 
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -27,12 +31,11 @@ export function initDb() {
 
   db = new Database(dbPath);
 
-  // WAL para mejor concurrencia lectura/escritura
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
   db.pragma('temp_store = MEMORY');
-  db.pragma('cache_size = -16000'); // ~16MB
+  db.pragma('cache_size = -16000');
 
   log.info(`DB abierta en ${dbPath}`);
 
@@ -138,6 +141,32 @@ function runMigrations(database) {
         // Reservado para futuras migraciones
       },
     },
+    {
+      version: 3,
+      up: () => {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS dialogues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            a_id TEXT NOT NULL,
+            b_id TEXT NOT NULL,
+            pair_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            messages_json TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_dialogues_pair
+            ON dialogues(pair_key, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dialogues_a
+            ON dialogues(a_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dialogues_b
+            ON dialogues(b_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dialogues_created
+            ON dialogues(created_at DESC);
+        `);
+      },
+    },
   ];
 
   const pending = migrations.filter(m => m.version > current);
@@ -161,10 +190,6 @@ function runMigrations(database) {
   tx();
   log.info(`Migraciones aplicadas: ${pending.length}`);
 }
-
-// ============================================================
-// Utilidades
-// ============================================================
 
 export function isDbReady() {
   return db !== null;
