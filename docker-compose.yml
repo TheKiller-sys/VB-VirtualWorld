@@ -1,0 +1,31 @@
+services:
+  cerebro-world:
+    build: .
+    image: cerebro-world:1.0.0
+    container_name: cerebro-world
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - BFF_PORT=5000
+      - BFF_HOST=0.0.0.0
+      - CEREBRO_URL=http://cerebro-digital:3000
+      - CEREBRO_ADMIN_TOKEN=${CEREBRO_ADMIN_TOKEN}
+      - WORLD_ADMIN_TOKEN=${WORLD_ADMIN_TOKEN}
+      - WORLD_DB_PATH=/app/data/world.db
+      - DEMO_MODE=${DEMO_MODE:-false}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cerebro-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  cerebro-net:
+    external: true
+    name: cerebro-digital_cerebro-net
