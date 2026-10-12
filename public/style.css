@@ -59,7 +59,7 @@ button:focus-visible {
 }
 
 /* ============================================================
-   Glassmorphism base
+   Glassmorphism
    ============================================================ */
 
 .glass {
@@ -215,7 +215,7 @@ button:focus-visible {
 }
 
 /* ============================================================
-   Panel lateral
+   Panel lateral (FIX: scroll natural)
    ============================================================ */
 
 #panel {
@@ -225,7 +225,7 @@ button:focus-visible {
   height: 100vh;
   width: 420px;
   max-width: 92vw;
-  padding: 26px 22px;
+  padding: 26px 22px 40px;
   overflow-y: auto;
   overflow-x: hidden;
   border-radius: 0;
@@ -234,8 +234,10 @@ button:focus-visible {
   border-bottom: none;
   transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1);
   z-index: 20;
-  display: flex;
-  flex-direction: column;
+  /* Scroll nativo y suave */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(120, 180, 255, 0.3) transparent;
+  overscroll-behavior: contain;
 }
 
 #panel.hidden {
@@ -247,9 +249,17 @@ button:focus-visible {
   width: 8px;
 }
 
+#panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 #panel::-webkit-scrollbar-thumb {
-  background: rgba(120, 180, 255, 0.2);
+  background: rgba(120, 180, 255, 0.25);
   border-radius: 4px;
+}
+
+#panel::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 180, 255, 0.4);
 }
 
 #panel-close {
@@ -274,11 +284,9 @@ button:focus-visible {
   color: #ff8080;
 }
 
+/* El contenido ya NO es flex. Deja que fluya y que #panel scrollee. */
 #panel-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
+  /* Sin flex, sin min-height */
 }
 
 #panel-content h2 {
@@ -394,7 +402,7 @@ button:focus-visible {
 }
 
 /* ============================================================
-   Relaciones (en detalle de entidad)
+   Relaciones
    ============================================================ */
 
 #panel-content .rel {
@@ -561,17 +569,9 @@ button:focus-visible {
   padding: 4px 0;
 }
 
-/* Stream de conversaciones */
+/* Stream de conversaciones: sin flex, fluye natural en el panel */
 .chat-stream {
-  flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  min-height: 0;
-  scroll-behavior: smooth;
+  display: block;
 }
 
 .chat-stream::-webkit-scrollbar {
@@ -583,11 +583,11 @@ button:focus-visible {
   border-radius: 3px;
 }
 
-/* Bloque de una conversación (agrupa sus mensajes) */
 .chat-conversation {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  margin-bottom: 20px;
 }
 
 .chat-conversation-header {
@@ -613,7 +613,6 @@ button:focus-visible {
   gap: 6px;
 }
 
-/* Mensaje individual */
 .chat-message {
   display: flex;
   max-width: 100%;
@@ -739,7 +738,7 @@ button:focus-visible {
   }
   #panel {
     width: 100vw;
-    padding: 18px 14px;
+    padding: 18px 14px 40px;
   }
   .chat-participants {
     padding: 8px;
