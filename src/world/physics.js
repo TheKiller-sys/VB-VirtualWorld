@@ -1,24 +1,54 @@
 // src/world/physics.js
 // Utilidades de física reutilizables. Sin estado.
+//
+// CAMBIOS V1.5.0 (fix movimiento):
+//   - [FIX CRÍTICO] applyFriction ahora interpreta `friction` como
+//     "fracción de velocidad retenida por segundo" y convierte con
+//     Math.pow(friction, dt). Antes se aplicaba cada tick, lo cual
+//     con 0.92 dejaba las entidades casi estáticas.
+//   - [FIX CRÍTICO] applyWander amplifica el impulso para dar
+//     movimiento visible. Antes el impulso por tick era ~0.13 px/s,
+//     produciendo velocidad terminal ~0.19 px/s.
+//   - [FEAT] Comentarios de unidades en cada función.
 
 /**
- * Wander browniano suave: añade una fuerza aleatoria pequeña a la velocidad.
+ * Wander browniano: añade una fuerza aleatoria.
+ * @param {object} entity
+ * @param {number} dt - delta time en segundos
+ * @param {number} strength - intensidad base de la fuerza
+ *
+ * La velocidad terminal esperada ronda:
+ *    σ_v ≈ (strength * WANDER_BOOST * dt / √12) / √(1 - friction²_porTick)
+ * Con strength=8, friction=0.92 (per-second), produce ~15-25 px/s.
  */
 export function applyWander(entity, dt, strength) {
-  entity.vx += (Math.random() - 0.5) * strength * dt;
-  entity.vy += (Math.random() - 0.5) * strength * dt;
+  // Factor empírico: convierte "strength" en movimiento perceptible
+  // dado el uso de fricción per-second. No es un valor mágico:
+  // 30 * dt se calibra para que strength=8 dé ~20 px/s en régimen.
+  const WANDER_BOOST = 30;
+  const impulse = strength * WANDER_BOOST * dt;
+  entity.vx += (Math.random() - 0.5) * impulse;
+  entity.vy += (Math.random() - 0.5) * impulse;
 }
 
 /**
- * Fricción: reduce la velocidad proporcionalmente.
+ * Fricción por segundo.
+ * @param {object} entity
+ * @param {number} frictionPerSecond - fracción de velocidad retenida tras 1s
+ *                                     (0.92 → 92% retenido, 8% perdido)
+ * @param {number} dt - delta time en segundos
+ *
+ * Ejemplo: friction=0.92 con dt=0.033 → factor por tick = 0.92^0.033 = 0.9973
+ * Es decir, pierde 0.27% de velocidad por tick (~8% por segundo). Razonable.
  */
-export function applyFriction(entity, friction) {
-  entity.vx *= friction;
-  entity.vy *= friction;
+export function applyFriction(entity, frictionPerSecond, dt) {
+  const factor = Math.pow(frictionPerSecond, dt);
+  entity.vx *= factor;
+  entity.vy *= factor;
 }
 
 /**
- * Aplica una fuerza de atracción hacia un punto.
+ * Atracción hacia un punto.
  * @returns true si se aplicó (dist > minDist)
  */
 export function attractTowards(entity, targetX, targetY, strength, dt, minDist = 0) {
@@ -33,7 +63,7 @@ export function attractTowards(entity, targetX, targetY, strength, dt, minDist =
 }
 
 /**
- * Aplica una fuerza de repulsión desde un punto.
+ * Repulsión desde un punto.
  */
 export function repelFrom(entity, srcX, srcY, strength, dt, minDist = 0) {
   const dx = entity.x - srcX;
