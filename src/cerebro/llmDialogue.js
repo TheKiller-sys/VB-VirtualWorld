@@ -1,12 +1,11 @@
 // src/cerebro/llmDialogue.js
 // Genera diálogos entre entidades usando el LLM del Cerebro.
 //
-// CAMBIOS V3.2.0 (FIX CRÍTICO):
-//   - [FIX] El rate limit se aplica SOLO al inicio de un diálogo.
-//     Antes, cada línea volvía a chequear el rate limit y cortaba
-//     el diálogo tras la primera línea ("LLM solo dio 1 línea(s)").
-//   - [FIX] Ahora las N líneas de un mismo diálogo se generan sin
-//     esperar el intervalo entre llamadas (solo una pequeña pausa).
+// CAMBIOS V3.3.0 (variedad de cierres):
+//   - [FEAT] Estilos rotativos de cierre: 10 variantes distintas para
+//     que el LLM no siempre cierre con "Me quedo con...".
+//   - [FEAT] Estilos rotativos para apertura y desarrollo también.
+//   - [FIX] Preserva el fix del rate limit (canContinueDialogue).
 
 import { callCerebro } from './client.js';
 import { env } from '../config/env.js';
@@ -37,13 +36,48 @@ const state = {
 };
 
 // ============================================================
+// Estilos rotativos de prompt por fase
+// ============================================================
+
+const CLOSING_STYLES = [
+  'Haz una reflexión corta que conecte con lo dicho.',
+  'Cierra con una imagen o metáfora concreta.',
+  'Termina con una pregunta abierta que quede flotando.',
+  'Cierra reconociendo algo específico del otro.',
+  'Termina con una invitación suave a continuar en otro momento.',
+  'Cierra con un cambio de tema sutil pero natural.',
+  'Termina con una observación personal, como si pensaras en voz alta.',
+  'Cierra con una imagen sensorial: un sonido, una textura, un color.',
+  'Termina admitiendo una duda o algo que no entendiste del todo.',
+  'Cierra de forma abrupta pero elegante, sin fórmulas de despedida.',
+];
+
+const OPENING_STYLES = [
+  'Abre con una observación sobre el entorno o el momento.',
+  'Abre retomando algo de la última conversación.',
+  'Abre con una pregunta genuina, no retórica.',
+  'Abre con una confesión breve o algo personal.',
+  'Abre con una reflexión filosófica sencilla.',
+  'Abre describiendo lo que estás sintiendo ahora mismo.',
+  'Abre con una idea que te ha estado dando vueltas.',
+  'Abre con un comentario sobre la presencia del otro.',
+];
+
+const MIDDLE_STYLES = [
+  'Profundiza en lo que se está hablando.',
+  'Introduce un matiz nuevo que amplíe el tema.',
+  'Conecta con algo que se dijo antes y desarróllalo.',
+  'Comparte una asociación libre que te sugiera el tema.',
+  'Reconoce una contradicción o una tensión.',
+  'Añade una pregunta que surja de lo dicho.',
+  'Reformula lo que entendiste para verificar.',
+  'Aporta un ejemplo concreto o una imagen.',
+];
+
+// ============================================================
 // API pública
 // ============================================================
 
-/**
- * ¿Podemos INICIAR un nuevo diálogo ahora mismo?
- * Aplica el rate limit global (LLM_DIALOGUE_MIN_INTERVAL_MS).
- */
 export function canCallLLM() {
   if (!env.llmDialogueEnabled) return false;
   if (state.inFlight) return false;
@@ -52,10 +86,6 @@ export function canCallLLM() {
   return true;
 }
 
-/**
- * ¿Podemos seguir haciendo llamadas DENTRO de un diálogo?
- * No aplica el rate limit global, solo el circuit breaker.
- */
 function canContinueDialogue() {
   if (!env.llmDialogueEnabled) return false;
   if (Date.now() < state.blockedUntil) return false;
@@ -67,7 +97,6 @@ function canContinueDialogue() {
  * @returns {Promise<Array<{entityId, text, delayMs, durationMs}>|null>}
  */
 export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
-  // Chequeo de rate limit SOLO al inicio
   if (!canCallLLM()) {
     state.totalSkipped++;
     return null;
@@ -90,10 +119,11 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 
   let accumulatedDelay = 0;
 
+  // Elegimos un "estilo" de cierre al azar por diálogo (rotación)
+  const closingStyle = CLOSING_STYLES[Math.floor(Math.random() * CLOSING_STYLES.length)];
+  const openingStyle = OPENING_STYLES[Math.floor(Math.random() * OPENING_STYLES.length)];
+
   for (let i = 0; i < targetLines; i++) {
-    // ✅ Uso canContinueDialogue() en vez de canCallLLM()
-    // Ya pasamos el rate limit al entrar; dentro solo chequeamos
-    // el circuit breaker (429, errores consecutivos).
     if (i > 0 && !canContinueDialogue()) {
       log.debug(`Circuit breaker activo en línea ${i + 1}, cortando`);
       break;
@@ -109,6 +139,8 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
         history: conversationHistory,
         lineIndex: i,
         totalLines: targetLines,
+        closingStyle,
+        openingStyle,
       });
 
       const response = await callCerebro('chat', {
@@ -124,12 +156,10 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 
       if (!text) {
         log.debug(`Línea ${i + 1} vacía tras limpiar. Raw: "${raw.slice(0, 100)}"`);
-        // No cortamos — intentamos la siguiente
         [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
         continue;
       }
 
-      // Anti-repetición
       const lastFromThisSpeaker = messages
         .slice()
         .reverse()
@@ -166,7 +196,6 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 
       [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
 
-      // Pausa corta entre llamadas (no es rate limit, solo cortesía)
       if (i < targetLines - 1) {
         const pauseMs = 350 + Math.random() * 200;
         await sleep(pauseMs);
@@ -258,7 +287,16 @@ function computeTargetLines(a, b) {
 // Prompt por línea
 // ============================================================
 
-function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex, totalLines }) {
+function buildLinePrompt({
+  speaker,
+  other,
+  previousMessages,
+  history,
+  lineIndex,
+  totalLines,
+  closingStyle,
+  openingStyle,
+}) {
   const speakerDesc = describeEntity(speaker);
   const otherDesc = describeEntity(other);
 
@@ -276,16 +314,21 @@ function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex,
   let phaseName, phaseInstruction;
   if (lineIndex === 0) {
     phaseName = 'APERTURA';
-    phaseInstruction = `Es tu PRIMER mensaje. Abre la conversación de forma natural pero con personalidad. No uses "hola, ¿cómo estás?" salvo si es literalmente la primera vez.`;
+    phaseInstruction = openingStyle;
   } else if (lineIndex === totalLines - 1) {
     phaseName = 'CIERRE';
-    phaseInstruction = `Es tu ÚLTIMO mensaje. Cierra la conversación de forma natural: un cierre, una reflexión corta, o una despedida. No dejes la conversación en el aire.`;
+    phaseInstruction =
+      `${closingStyle}\n` +
+      `NO uses fórmulas como "me quedo con...", "así que...", "por ahora..." ` +
+      `ni despedidas genéricas. Sé original.`;
   } else if (progress < 0.5) {
     phaseName = 'DESARROLLO TEMPRANO';
-    phaseInstruction = `Estás en medio de la conversación. Profundiza en lo que se está hablando o introduce un matiz nuevo. NO cambies de tema abruptamente.`;
+    phaseInstruction = MIDDLE_STYLES[lineIndex % MIDDLE_STYLES.length];
   } else {
     phaseName = 'DESARROLLO TARDÍO';
-    phaseInstruction = `La conversación va avanzando. Conecta con lo dicho antes, muestra comprensión, o lleva el tema hacia un cierre próximo.`;
+    phaseInstruction =
+      'La conversación va avanzando hacia el cierre. ' +
+      'Conecta con lo dicho antes o lleva el tema hacia algo más profundo.';
   }
 
   return (
@@ -305,7 +348,8 @@ function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex,
     `3. Coherente con lo que ya se ha dicho\n` +
     `4. Refleja tu personalidad (${speaker.dominantEmotion}, ${speaker.dominantIntent})\n` +
     `5. Español natural, sin formalidades vacías\n` +
-    `6. NO repitas lo que ya dijiste antes\n\n` +
+    `6. NO repitas lo que ya dijiste antes\n` +
+    `7. Si es el cierre, NO uses "me quedo con..." ni fórmulas similares\n\n` +
     `Escribe solo la frase:`
   );
 }
@@ -337,7 +381,7 @@ function formatPastHistory(history, speaker, other) {
 }
 
 // ============================================================
-// Limpieza
+// Limpieza de la línea
 // ============================================================
 
 function cleanLine(raw) {
