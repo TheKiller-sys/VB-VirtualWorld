@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#0a0e17">
+  <title>Cerebro World — Mundo vivo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- ============================================================
+       Canvas principal
+       ============================================================ -->
+  <canvas id="world" aria-label="Mundo 2D"></canvas>
+
+  <!-- ============================================================
+       HUD superior izquierdo
+       ============================================================ -->
+  <div id="hud" class="glass">
+    <div class="hud-row">
+      <span class="dot" id="dot-ws"></span>
+      <span id="stat-ws">conectando…</span>
+    </div>
+    <div class="hud-row">
+      <span class="dot dot-green pulse"></span>
+      <span id="stat-entities">0 entidades</span>
+    </div>
+    <div class="hud-row">
+      <span class="dot dot-blue"></span>
+      <span id="stat-tick">tick 0</span>
+    </div>
+    <div class="hud-row">
+      <span class="dot dot-purple"></span>
+      <span id="stat-relations">0 relaciones</span>
+    </div>
+  </div>
+
+  <!-- ============================================================
+       Leyenda de emociones (abajo izquierda)
+       ============================================================ -->
+  <div id="legend" class="glass">
+    <div class="legend-title">Emociones</div>
+    <div class="legend-grid" id="legend-grid"></div>
+  </div>
+
+  <!-- ============================================================
+       Controles (arriba derecha)
+       ============================================================ -->
+  <div id="controls" class="glass">
+    <button id="btn-reset" title="Reset cámara (R)">⟲</button>
+    <button id="btn-relations" title="Ver relaciones (L)" class="active">🔗</button>
+    <button id="btn-labels" title="Ver etiquetas (N)" class="active">🏷️</button>
+    <button id="btn-trails" title="Ver estelas (T)">✨</button>
+    <button id="btn-fullscreen" title="Pantalla completa (F)">⛶</button>
+  </div>
+
+  <!-- ============================================================
+       Panel lateral de detalle
+       ============================================================ -->
+  <aside id="panel" class="glass hidden" aria-hidden="true">
+    <button id="panel-close" aria-label="Cerrar">×</button>
+    <div id="panel-content"></div>
+  </aside>
+
+  <!-- ============================================================
+       Banner de estado de conexión (transitorio)
+       ============================================================ -->
+  <div id="toast" class="hidden"></div>
+
+  <!-- ============================================================
+       Módulos del frontend
+       ============================================================ -->
+  <script type="module" src="/world.js"></script>
+</body>
+</html>
