@@ -1,0 +1,25 @@
+{
+  "name": "cerebro-world",
+  "version": "1.0.0",
+  "description": "Mundo 2D vivo proyectado desde el Cerebro Digital V7.3.16",
+  "type": "module",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "reset-db": "node -e \"import('fs').then(fs=>fs.rmSync('./data/world.db',{force:true}))\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "compression": "^1.7.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "undici": "^6.19.8",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
