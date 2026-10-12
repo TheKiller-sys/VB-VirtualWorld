@@ -2,8 +2,8 @@ services:
   - type: web
     name: cerebro-world
     runtime: docker
-    plan: standard          # free no soporta disk persistente
-    region: oregon          # ajusta a tu región
+    plan: standard
+    region: oregon
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     disk:
@@ -15,22 +15,52 @@ services:
         value: production
       - key: BFF_HOST
         value: 0.0.0.0
-      # PORT lo inyecta Render automáticamente
       - key: WORLD_DB_PATH
         value: /app/data/world.db
+
       - key: CEREBRO_URL
-        sync: false          # lo pones manualmente en el dashboard
+        sync: false
       - key: CEREBRO_ADMIN_TOKEN
         sync: false
+
       - key: WORLD_ADMIN_TOKEN
-        generateValue: true  # Render lo genera por ti
+        generateValue: true
       - key: WORLD_WS_TOKEN
         generateValue: true
+
       - key: DEMO_MODE
         value: "false"
       - key: LOG_LEVEL
         value: info
+
       - key: MAX_TOTAL_ENTITIES
         value: "500"
       - key: MAX_SIMULATED_PER_IP
         value: "20"
+
+      - key: CEREBRO_INITIAL_DELAY_MS
+        value: "30000"
+      - key: CEREBRO_MIN_INTERVAL_MS
+        value: "30000"
+      - key: CEREBRO_MAX_INTERVAL_MS
+        value: "300000"
+      - key: CEREBRO_MAX_SESSIONS_PER_POLL
+        value: "50"
+      - key: CEREBRO_MAX_FULL_PROFILES
+        value: "3"
+
+      - key: LLM_DIALOGUE_ENABLED
+        value: "true"
+      - key: LLM_DIALOGUE_MIN_INTERVAL_MS
+        value: "30000"
+      - key: LLM_DIALOGUE_MAX_LINES
+        value: "3"
+      - key: LLM_DIALOGUE_CACHE_SIZE
+        value: "200"
+      - key: LLM_DIALOGUE_CACHE_TTL_MS
+        value: "7200000"
+      - key: LLM_DIALOGUE_SESSION_ID
+        value: world_sim_v1
+
+      - key: COMMUNITY_PROTOCOL_ENABLED
+        value: "false"
