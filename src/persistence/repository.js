@@ -1,5 +1,9 @@
 // src/persistence/repository.js
 // Capa de acceso a datos. Toda la lógica de SQL vive aquí.
+//
+// CAMBIOS V1.6.0:
+//   - [FEAT] DialogueRepo: persistencia de diálogos entre pares de
+//     entidades. Búsqueda por par o por entidad.
 
 import { getDb } from './db.js';
 import { env } from '../config/env.js';
@@ -151,9 +155,6 @@ export const RelationshipRepo = {
     return db.prepare('DELETE FROM relationships WHERE strength < ?').run(minStrength);
   },
 
-  /**
-   * Reemplaza TODAS las relaciones. Útil para snapshot atómico.
-   */
   replaceAll(rows) {
     const db = getDb();
     const del = db.prepare('DELETE FROM relationships');
@@ -318,13 +319,124 @@ export const SnapshotRepo = {
 };
 
 // ============================================================
+// Diálogos (NUEVO V1.6.0)
+// ============================================================
+
+export const DialogueRepo = {
+  /**
+   * Inserta un diálogo entre dos entidades.
+   * @param {object} d
+   *   - aId, bId: IDs de las entidades
+   *   - source: 'llm' | 'cache' | 'template'
+   *   - messages: array de { entityId, text, delayMs, durationMs }
+   *   - startedAt: timestamp (ms)
+   */
+  insert(d) {
+    if (!d || !d.aId || !d.bId || !Array.isArray(d.messages)) return null;
+    if (d.messages.length === 0) return null;
+
+    const db = getDb();
+    const now = Date.now();
+    const pairKey = d.aId < d.bId
+      ? `${d.aId}|${d.bId}`
+      : `${d.bId}|${d.aId}`;
+
+    const stmt = db.prepare(`
+      INSERT INTO dialogues (a_id, b_id, pair_key, source, messages_json, started_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const r = stmt.run(
+      String(d.aId),
+      String(d.bId),
+      pairKey,
+      String(d.source || 'unknown').slice(0, 20),
+      JSON.stringify(d.messages),
+      Number(d.startedAt) || now,
+      now,
+    );
+
+    return r.lastInsertRowid;
+  },
+
+  /**
+   * Lista diálogos entre dos entidades concretas.
+   */
+  listByPair(aId, bId, limit = 50) {
+    if (!aId || !bId) return [];
+    const db = getDb();
+    const pairKey = aId < bId
+      ? `${aId}|${bId}`
+      : `${bId}|${aId}`;
+
+    const rows = db.prepare(`
+      SELECT * FROM dialogues
+      WHERE pair_key = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(pairKey, limit);
+
+    return rows.map(rowToDialogue);
+  },
+
+  /**
+   * Lista todos los diálogos donde participe la entidad.
+   */
+  listByEntity(id, limit = 100) {
+    if (!id) return [];
+    const db = getDb();
+
+    const rows = db.prepare(`
+      SELECT * FROM dialogues
+      WHERE a_id = ? OR b_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(id, id, limit);
+
+    return rows.map(rowToDialogue);
+  },
+
+  count() {
+    const db = getDb();
+    const r = db.prepare('SELECT COUNT(*) AS c FROM dialogues').get();
+    return r.c;
+  },
+
+  prune(maxRows) {
+    const db = getDb();
+    const keep = Math.max(100, Number(maxRows) || 10000);
+    const r = db.prepare(`
+      DELETE FROM dialogues
+      WHERE id NOT IN (
+        SELECT id FROM dialogues ORDER BY created_at DESC LIMIT ?
+      )
+    `).run(keep);
+    return r.changes;
+  },
+};
+
+function rowToDialogue(row) {
+  let messages = [];
+  try {
+    messages = JSON.parse(row.messages_json);
+  } catch (_) {}
+
+  return {
+    id: row.id,
+    aId: row.a_id,
+    bId: row.b_id,
+    pairKey: row.pair_key,
+    source: row.source,
+    messages,
+    startedAt: row.started_at,
+    createdAt: row.created_at,
+  };
+}
+
+// ============================================================
 // Persistencia agregada del mundo
 // ============================================================
 
-/**
- * Guarda el estado completo del mundo en una transacción.
- * @param {import('../world/World.js').World} world
- */
 export function persistWorld(world) {
   const { entities, relations } = world.toPersistable();
   const now = Date.now();
@@ -363,15 +475,10 @@ export function persistWorld(world) {
   return { entities: entityRows.length, relations: relRows.length };
 }
 
-/**
- * Reconstruye el mundo desde la DB.
- * @param {import('../world/World.js').World} world
- */
 export function restoreWorld(world) {
   const entityRows = EntityRepo.listAlive(5000);
   const relRows = RelationshipRepo.listAbove(0.001);
 
-  // Adaptar al formato que espera world.restoreFrom
   const entities = entityRows.map(r => ({
     id: r.id,
     isSimulated: r.is_simulated,
@@ -411,5 +518,6 @@ export function getDbStats() {
     relationships: RelationshipRepo.count(),
     events: EventRepo.count(),
     snapshots: SnapshotRepo.count(),
+    dialogues: DialogueRepo.count(),
   };
 }
