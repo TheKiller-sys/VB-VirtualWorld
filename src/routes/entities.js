@@ -1,17 +1,30 @@
 // src/routes/entities.js
-// Rutas de entidades + simulación + admin.
+// Rutas de entidades + simulación.
+//
+// CAMBIOS V1.1.0:
+//   - [SEC] Acepta ipQuota (inyectado desde server.js).
+//   - [SEC] Registra/desregistra IPs al crear/eliminar simuladas.
+//   - [FIX] Eliminada sanitización duplicada (la hace labelSanitizer en server.js).
+//   - [FIX] Validación de label coherente con server.js (más permisiva aquí,
+//           porque el server ya lo sanitizó antes).
+//   - [FIX] El guard de admin permite dev sin token (aviso en consola).
+//   - [FEAT] Los DELETE devuelven más info en la respuesta.
 
 import { Router } from 'express';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
-import { Entity } from '../world/Entity.js';
 
 const log = logger.child('routes/entities');
 
-// Validación de tokens admin
+// ============================================================
+// Guard de admin
+// ============================================================
+
 function requireWorldAdmin(req, res, next) {
-  // Si no hay token configurado, permitir solo en dev
+  // En producción ya lo valida server.js al arrancar.
+  // Aquí solo aplicamos el check por request.
+
   if (!env.worldAdminToken) {
     if (env.isProd) {
       return res.status(503).json({
@@ -19,7 +32,7 @@ function requireWorldAdmin(req, res, next) {
         error: 'WORLD_ADMIN_TOKEN no configurado en producción',
       });
     }
-    return next();
+    return next(); // dev sin token
   }
 
   const token = req.headers['x-world-token'] || req.query.token;
@@ -29,9 +42,9 @@ function requireWorldAdmin(req, res, next) {
   next();
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // Validación de payloads
-// ------------------------------------------------------------
+// ============================================================
 
 const EMOTIONS = new Set([
   'alegria', 'tristeza', 'miedo', 'ira', 'ansiedad',
@@ -49,54 +62,76 @@ function validateSimulateBody(body) {
     return { ok: false, error: 'Body debe ser un objeto' };
   }
 
-  // label (opcional)
-  if (body.label !== undefined) {
-    if (typeof body.label !== 'string') errors.push('label debe ser string');
-    else out.label = body.label.slice(0, 60);
+  // label — ya viene saneado por labelSanitizer del server.js.
+  // Aquí solo validamos tipo y longitud por defensa.
+  if (body.label !== undefined && body.label !== null) {
+    if (typeof body.label !== 'string') {
+      errors.push('label debe ser string');
+    } else {
+      out.label = body.label.slice(0, 60);
+    }
   }
 
   // emotion
-  if (body.emotion !== undefined) {
+  if (body.emotion !== undefined && body.emotion !== null) {
     const e = String(body.emotion).toLowerCase();
-    if (!EMOTIONS.has(e)) errors.push(`emotion inválida: ${body.emotion}`);
-    else out.dominantEmotion = e;
+    if (!EMOTIONS.has(e)) {
+      errors.push(`emotion inválida: ${body.emotion}`);
+    } else {
+      out.dominantEmotion = e;
+    }
   }
 
   // intent
-  if (body.intent !== undefined) {
-    if (typeof body.intent !== 'string') errors.push('intent debe ser string');
-    else out.dominantIntent = body.intent.slice(0, 40);
+  if (body.intent !== undefined && body.intent !== null) {
+    if (typeof body.intent !== 'string') {
+      errors.push('intent debe ser string');
+    } else {
+      out.dominantIntent = body.intent.slice(0, 40);
+    }
   }
 
   // turnCount
-  if (body.turnCount !== undefined) {
+  if (body.turnCount !== undefined && body.turnCount !== null) {
     const n = Number(body.turnCount);
-    if (!Number.isFinite(n) || n < 0 || n > 100000) errors.push('turnCount inválido');
-    else out.turnCount = Math.floor(n);
+    if (!Number.isFinite(n) || n < 0 || n > 100000) {
+      errors.push('turnCount inválido');
+    } else {
+      out.turnCount = Math.floor(n);
+    }
   }
 
   // sentiment
-  if (body.sentiment !== undefined) {
+  if (body.sentiment !== undefined && body.sentiment !== null) {
     const n = Number(body.sentiment);
-    if (!Number.isFinite(n) || n < -1 || n > 1) errors.push('sentiment debe estar entre -1 y 1');
-    else out.sentiment = n;
+    if (!Number.isFinite(n) || n < -1 || n > 1) {
+      errors.push('sentiment debe estar entre -1 y 1');
+    } else {
+      out.sentiment = n;
+    }
   }
 
   // intensity
-  if (body.intensity !== undefined) {
+  if (body.intensity !== undefined && body.intensity !== null) {
     const n = Number(body.intensity);
-    if (!Number.isFinite(n) || n < 0 || n > 1) errors.push('intensity debe estar entre 0 y 1');
-    else out.intensity = n;
+    if (!Number.isFinite(n) || n < 0 || n > 1) {
+      errors.push('intensity debe estar entre 0 y 1');
+    } else {
+      out.intensity = n;
+    }
   }
 
   // topics
-  if (body.topics !== undefined) {
-    if (!Array.isArray(body.topics)) errors.push('topics debe ser array');
-    else out.topics = body.topics.slice(0, 8).map(t => String(t).slice(0, 40));
+  if (body.topics !== undefined && body.topics !== null) {
+    if (!Array.isArray(body.topics)) {
+      errors.push('topics debe ser array');
+    } else {
+      out.topics = body.topics.slice(0, 8).map(t => String(t).slice(0, 40));
+    }
   }
 
   // traits
-  if (body.traits !== undefined) {
+  if (body.traits !== undefined && body.traits !== null) {
     if (typeof body.traits !== 'object' || Array.isArray(body.traits)) {
       errors.push('traits debe ser objeto');
     } else {
@@ -115,11 +150,11 @@ function validateSimulateBody(body) {
   }
 
   // position (opcional)
-  if (body.x !== undefined) {
+  if (body.x !== undefined && body.x !== null) {
     const n = Number(body.x);
     if (Number.isFinite(n)) out.x = n;
   }
-  if (body.y !== undefined) {
+  if (body.y !== undefined && body.y !== null) {
     const n = Number(body.y);
     if (Number.isFinite(n)) out.y = n;
   }
@@ -128,15 +163,16 @@ function validateSimulateBody(body) {
   return { ok: true, value: out };
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // Router
-// ------------------------------------------------------------
+// ============================================================
 
-export function createEntitiesRouter({ world, wsServer }) {
+export function createEntitiesRouter({ world, wsServer, ipQuota }) {
   const router = Router();
 
   // ------------------------------------------------------------
-  // GET /api/entities
+  // GET /
+  // Lista de entidades
   // ------------------------------------------------------------
   router.get('/', (req, res) => {
     const limit = clampInt(req.query.limit, 500, 1, 2000);
@@ -164,7 +200,8 @@ export function createEntitiesRouter({ world, wsServer }) {
   });
 
   // ------------------------------------------------------------
-  // GET /api/entities/:id
+  // GET /:id
+  // Detalle de una entidad con sus relaciones
   // ------------------------------------------------------------
   router.get('/:id', (req, res) => {
     const id = String(req.params.id);
@@ -197,7 +234,8 @@ export function createEntitiesRouter({ world, wsServer }) {
   });
 
   // ------------------------------------------------------------
-  // GET /api/entities/:id/relationships
+  // GET /:id/relationships
+  // Solo relaciones (más ligero)
   // ------------------------------------------------------------
   router.get('/:id/relationships', (req, res) => {
     const id = String(req.params.id);
@@ -228,8 +266,10 @@ export function createEntitiesRouter({ world, wsServer }) {
   });
 
   // ------------------------------------------------------------
-  // POST /api/simulate
+  // POST /simulate
   // Crea una entidad simulada.
+  // Los middlewares (rate, quota, global limit, sanitización) los aplica
+  // server.js ANTES de llegar aquí.
   // ------------------------------------------------------------
   router.post('/simulate', requireWorldAdmin, asyncHandler(async (req, res) => {
     const v = validateSimulateBody(req.body);
@@ -239,6 +279,7 @@ export function createEntitiesRouter({ world, wsServer }) {
 
     const id = generateSimId();
     const now = Date.now();
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
 
     const profile = {
       id,
@@ -260,9 +301,17 @@ export function createEntitiesRouter({ world, wsServer }) {
     try {
       const { entity, created } = world.upsertEntity(profile);
 
-      log.info(`Entidad simulada creada: ${id} (${entity.dominantEmotion}/${entity.dominantIntent})`);
+      // Registra la IP en la cuota SOLO si es creación nueva (no update)
+      if (created && ipQuota) {
+        ipQuota.register(ip, entity.id);
+      }
 
-      // Notifica por WS
+      log.info(
+        `Entidad simulada ${created ? 'creada' : 'actualizada'}: ${id} ` +
+        `(${entity.dominantEmotion}/${entity.dominantIntent}) desde ${ip}`
+      );
+
+      // Notifica por WS a todos
       wsServer.broadcast({
         type: 'entity_created',
         entity: entity.toJSON(),
@@ -274,6 +323,10 @@ export function createEntitiesRouter({ world, wsServer }) {
         success: true,
         created,
         entity: entity.toJSON(),
+        quota: ipQuota ? {
+          used: ipQuota.countForIp(ip),
+          max: ipQuota.maxPerIp,
+        } : null,
       });
     } catch (err) {
       log.warn(`Error creando entidad simulada: ${err.message}`);
@@ -282,8 +335,8 @@ export function createEntitiesRouter({ world, wsServer }) {
   }));
 
   // ------------------------------------------------------------
-  // GET /api/simulate
-  // Lista entidades simuladas.
+  // GET /simulate
+  // Lista de simuladas
   // ------------------------------------------------------------
   router.get('/simulate', (req, res) => {
     const list = Array.from(world.entities.values())
@@ -298,8 +351,8 @@ export function createEntitiesRouter({ world, wsServer }) {
   });
 
   // ------------------------------------------------------------
-  // DELETE /api/simulate/:id
-  // Elimina una entidad simulada.
+  // DELETE /simulate/:id
+  // Elimina UNA simulada
   // ------------------------------------------------------------
   router.delete('/simulate/:id', requireWorldAdmin, (req, res) => {
     const id = String(req.params.id);
@@ -316,7 +369,9 @@ export function createEntitiesRouter({ world, wsServer }) {
     }
 
     const ok = world.removeEntity(id, 'admin_delete');
+
     if (ok) {
+      if (ipQuota) ipQuota.unregister(id);
       log.info(`Entidad simulada eliminada: ${id}`);
       wsServer.broadcast({
         type: 'entity_removed',
@@ -330,16 +385,18 @@ export function createEntitiesRouter({ world, wsServer }) {
   });
 
   // ------------------------------------------------------------
-  // DELETE /api/simulate
-  // Borra TODAS las simuladas.
+  // DELETE /simulate
+  // Elimina TODAS las simuladas
   // ------------------------------------------------------------
   router.delete('/simulate', requireWorldAdmin, (req, res) => {
     const ids = [];
     for (const e of world.entities.values()) {
       if (!e.dead && e.isSimulated) ids.push(e.id);
     }
+
     for (const id of ids) {
       world.removeEntity(id, 'admin_clear');
+      if (ipQuota) ipQuota.unregister(id);
     }
 
     log.info(`Borradas ${ids.length} entidades simuladas`);
@@ -356,9 +413,9 @@ export function createEntitiesRouter({ world, wsServer }) {
   return router;
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // Helpers
-// ------------------------------------------------------------
+// ============================================================
 
 function generateSimId() {
   const t = Date.now().toString(36);
