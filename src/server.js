@@ -1,5 +1,18 @@
 // src/server.js
-// Punto de entrada. Orquesta: DB → mundo → poller → HTTP → WS → simulación → shutdown.
+// Punto de entrada de Cerebro World.
+// Orquesta: DB → mundo → poller → HTTP → WS → simulación → shutdown.
+//
+// CAMBIOS V1.1.0 (endurecimiento):
+//   - [SEC] WORLD_WS_TOKEN obligatorio en producción.
+//   - [SEC] Rate limit dedicado para /api/simulate (por IP).
+//   - [SEC] Cuota de simuladas por IP (default 20).
+//   - [SEC] Límite global de entidades (default 500).
+//   - [SEC] Sanitización de labels (blacklist + normalización Unicode).
+//   - [PERF] Primer poll silencioso: no spamea entity_born al arrancar.
+//   - [FEAT] Endpoint GET /api/events (histórico de eventos).
+//   - [FEAT] Endpoint GET /api/entities/:id/events (eventos por entidad).
+//   - [FIX] Rutas de /api/simulate montadas correctamente (sin hack).
+//   - [FIX] Eliminado require() roto en el router de /api/events.
 
 import http from 'http';
 import path from 'path';
@@ -29,6 +42,10 @@ import {
   SnapshotRepo,
 } from './persistence/repository.js';
 
+// ============================================================
+// Constantes y estado global
+// ============================================================
+
 const log = logger.child('server');
 const STARTED_AT = Date.now();
 
@@ -37,10 +54,20 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
-// ============================================================
-// Estado global
-// ============================================================
+// Límites duros de seguridad
+const LIMITS = Object.freeze({
+  // Máximo de entidades totales (reales + simuladas) vivas en el mundo
+  MAX_TOTAL_ENTITIES: Number(process.env.MAX_TOTAL_ENTITIES) || 500,
+  // Máximo de simuladas activas por IP
+  MAX_SIMULATED_PER_IP: Number(process.env.MAX_SIMULATED_PER_IP) || 20,
+  // Rate limit específico de /api/simulate (por IP)
+  SIMULATE_RATE_WINDOW_MS: Number(process.env.SIMULATE_RATE_WINDOW_MS) || 60000,
+  SIMULATE_RATE_MAX: Number(process.env.SIMULATE_RATE_MAX) || 5,
+  // Longitud máxima de label
+  MAX_LABEL_LENGTH: 60,
+});
 
+// Estado global (singleton)
 let world = null;
 let poller = null;
 let wsServer = null;
@@ -52,13 +79,20 @@ let snapshotTimer = null;
 let pruneTimer = null;
 let lastTickAt = Date.now();
 
+// Para detectar primer poll y silenciar eventos
+let firstPollCompleted = false;
+
+// Estado de shutdown
 let shuttingDown = false;
 
 // ============================================================
-// Rate limit simple en memoria
+// Rate limiting
 // ============================================================
 
-function createRateLimiter({ windowMs, max }) {
+/**
+ * Crea un rate limiter en memoria. Limpia entradas expiradas periódicamente.
+ */
+function createRateLimiter({ windowMs, max, keyPrefix = 'rl' }) {
   const hits = new Map();
 
   const cleanup = setInterval(() => {
@@ -66,11 +100,12 @@ function createRateLimiter({ windowMs, max }) {
     for (const [k, v] of hits) {
       if (v.resetAt < now) hits.delete(k);
     }
-  }, windowMs);
+  }, Math.max(30000, windowMs));
   if (cleanup.unref) cleanup.unref();
 
-  return (req, res, next) => {
-    const key = req.ip || req.socket?.remoteAddress || 'unknown';
+  const middleware = (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${ip}`;
     const now = Date.now();
 
     let entry = hits.get(key);
@@ -87,10 +122,211 @@ function createRateLimiter({ windowMs, max }) {
     if (entry.count > max) {
       const retryAfter = Math.ceil((entry.resetAt - now) / 1000);
       res.set('Retry-After', String(retryAfter));
-      return res.status(429).json({ success: false, error: 'Demasiadas peticiones' });
+      return res.status(429).json({
+        success: false,
+        error: 'Demasiadas peticiones. Intenta más tarde.',
+        retryAfter,
+      });
     }
     next();
   };
+
+  middleware.reset = (ip) => {
+    for (const k of hits.keys()) {
+      if (k.endsWith(`:${ip}`)) hits.delete(k);
+    }
+  };
+  middleware.stats = () => ({ size: hits.size, windowMs, max });
+
+  return middleware;
+}
+
+// ============================================================
+// Cuotas por IP
+// ============================================================
+
+/**
+ * Registro de simuladas activas por IP.
+ * Se rellena cuando se crea una simulada y se limpia cuando muere.
+ */
+class IpQuota {
+  constructor(maxPerIp) {
+    this.maxPerIp = maxPerIp;
+    this.byIp = new Map();  // ip → Set<entityId>
+  }
+
+  canCreate(ip) {
+    const set = this.byIp.get(ip);
+    if (!set) return true;
+    return set.size < this.maxPerIp;
+  }
+
+  register(ip, entityId) {
+    let set = this.byIp.get(ip);
+    if (!set) {
+      set = new Set();
+      this.byIp.set(ip, set);
+    }
+    set.add(entityId);
+  }
+
+  unregister(entityId) {
+    for (const set of this.byIp.values()) {
+      if (set.has(entityId)) set.delete(entityId);
+    }
+  }
+
+  countForIp(ip) {
+    return this.byIp.get(ip)?.size || 0;
+  }
+
+  getStats() {
+    return {
+      maxPerIp: this.maxPerIp,
+      uniqueIps: this.byIp.size,
+      totalTracked: Array.from(this.byIp.values()).reduce((s, v) => s + v.size, 0),
+    };
+  }
+}
+
+let ipQuota = null;
+
+// ============================================================
+// Sanitización de labels
+// ============================================================
+
+// Palabras prohibidas (amplía según necesidad)
+// Se comparan en minúsculas, sin acentos, sin caracteres especiales
+const LABEL_BLACKLIST = [
+  // Insultos comunes
+  'puta', 'puto', 'mierda', 'cabron', 'cabrona', 'pendejo', 'pendeja',
+  'culero', 'culera', 'verga', 'chinga', 'joder', 'coño', 'hostia',
+  'fuck', 'shit', 'bitch', 'asshole', 'bastard', 'dick', 'cunt',
+  // Slurs (lista corta; amplía con cuidado)
+  'nigger', 'nigga', 'faggot', 'retard',
+  // Contenido peligroso
+  'kys', 'kill yourself', 'matate',
+];
+
+// Regex de control: elimina caracteres de control y de formato bidi
+const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+
+// Regex de HTML/JS obvio
+const HTML_TAG_RE = /<[^>]*>/g;
+const SCRIPT_PROTO_RE = /javascript:|data:text\/html|vbscript:/gi;
+
+function normalizeForFilter(s) {
+  return s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // elimina acentos
+    .replace(/[^a-z0-9\s]/g, '')     // solo letras/números/espacios
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sanitizeLabel(rawLabel) {
+  if (rawLabel === null || rawLabel === undefined) {
+    return { ok: true, value: null };
+  }
+  if (typeof rawLabel !== 'string') {
+    return { ok: false, error: 'label debe ser string' };
+  }
+
+  let s = rawLabel;
+
+  // 1. Elimina caracteres de control
+  s = s.replace(CONTROL_CHARS_RE, '');
+
+  // 2. Elimina tags HTML
+  s = s.replace(HTML_TAG_RE, '');
+
+  // 3. Elimina protocolos peligrosos
+  s = s.replace(SCRIPT_PROTO_RE, '');
+
+  // 4. Trim y colapsa espacios
+  s = s.replace(/\s+/g, ' ').trim();
+
+  // 5. Trunca
+  if (s.length > LIMITS.MAX_LABEL_LENGTH) {
+    s = s.slice(0, LIMITS.MAX_LABEL_LENGTH).trim();
+  }
+
+  // 6. Verifica blacklist
+  const normalized = normalizeForFilter(s);
+  for (const bad of LABEL_BLACKLIST) {
+    if (normalized.includes(bad)) {
+      return { ok: false, error: 'El label contiene contenido no permitido' };
+    }
+  }
+
+  // 7. Longitud mínima
+  if (s.length > 0 && s.length < 2) {
+    return { ok: false, error: 'label demasiado corto (mínimo 2 caracteres)' };
+  }
+
+  return { ok: true, value: s || null };
+}
+
+// ============================================================
+// Middlewares específicos del server
+// ============================================================
+
+/**
+ * Middleware de sanitización del label para POST /api/simulate.
+ * Sustituye req.body.label por su versión saneada.
+ */
+function labelSanitizer(req, res, next) {
+  if (req.method !== 'POST') return next();
+  if (!req.body || typeof req.body !== 'object') return next();
+
+  const result = sanitizeLabel(req.body.label);
+  if (!result.ok) {
+    return res.status(400).json({ success: false, error: result.error });
+  }
+  req.body.label = result.value;
+  next();
+}
+
+/**
+ * Middleware de cuota por IP para POST /api/simulate.
+ */
+function quotaGuard(req, res, next) {
+  if (req.method !== 'POST') return next();
+
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+
+  if (!ipQuota.canCreate(ip)) {
+    log.warn(`Cuota excedida para IP ${ip} (${ipQuota.countForIp(ip)}/${LIMITS.MAX_SIMULATED_PER_IP})`);
+    return res.status(429).json({
+      success: false,
+      error: `Has alcanzado el límite de ${LIMITS.MAX_SIMULATED_PER_IP} entidades simuladas activas`,
+      quota: {
+        used: ipQuota.countForIp(ip),
+        max: LIMITS.MAX_SIMULATED_PER_IP,
+      },
+    });
+  }
+  next();
+}
+
+/**
+ * Middleware de límite global de entidades.
+ */
+function globalEntityLimitGuard(req, res, next) {
+  if (req.method !== 'POST') return next();
+
+  const current = world.entities.size;
+  if (current >= LIMITS.MAX_TOTAL_ENTITIES) {
+    log.warn(`Límite global de entidades alcanzado (${current}/${LIMITS.MAX_TOTAL_ENTITIES})`);
+    return res.status(503).json({
+      success: false,
+      error: 'El mundo está lleno. Intenta más tarde.',
+      limit: LIMITS.MAX_TOTAL_ENTITIES,
+      current,
+    });
+  }
+  next();
 }
 
 // ============================================================
@@ -99,6 +335,9 @@ function createRateLimiter({ windowMs, max }) {
 
 async function start() {
   log.info(`🌍 Cerebro World arrancando (env=${env.nodeEnv}, demo=${env.demoMode})`);
+
+  // ---------- 0. Validaciones de seguridad críticas ----------
+  validateSecurityConfig();
 
   // ---------- 1. DB ----------
   initDb();
@@ -129,37 +368,52 @@ async function start() {
     log.warn(`No se pudo restaurar el mundo: ${err.message}`);
   }
 
-  // ---------- 4. Demo mode ----------
+  // ---------- 4. Cuota por IP ----------
+  ipQuota = new IpQuota(LIMITS.MAX_SIMULATED_PER_IP);
+
+  // Re-registra simuladas restauradas (best effort: sin IP original, las
+  // marcamos como "sistema"). En la práctica, al morir se desregistrarán.
+  for (const e of world.entities.values()) {
+    if (e.isSimulated) {
+      ipQuota.register('__restored__', e.id);
+    }
+  }
+
+  // ---------- 5. Demo mode ----------
   if (env.demoMode) {
     seedDemoEntities(world, env.demoEntityCount);
   }
 
-  // ---------- 5. Poller ----------
+  // ---------- 6. Poller ----------
   poller = new Poller(world, {
     intervalMs: env.pollIntervalMs,
     sessionsLimit: env.pollSessionsLimit,
     onNewEntity: (profile) => {
-      if (wsServer) {
-        const e = world.getEntity(profile.id);
-        if (e) {
-          wsServer.broadcast({
-            type: 'entity_created',
-            entity: e.toJSON(),
-            isSimulated: false,
-            at: Date.now(),
-          });
-        }
+      // Silencia el primer poll para no spamear entity_born al arrancar
+      if (!firstPollCompleted) return;
+      if (!wsServer) return;
+      const e = world.getEntity(profile.id);
+      if (e) {
+        wsServer.broadcast({
+          type: 'entity_created',
+          entity: e.toJSON(),
+          isSimulated: false,
+          at: Date.now(),
+        });
       }
     },
   });
 
   if (!env.demoMode) {
     poller.start();
+    // Marca el primer poll como completado tras un ciclo
+    setTimeout(() => { firstPollCompleted = true; }, env.pollIntervalMs + 2000).unref?.();
   } else {
     log.info('🚧 Demo mode: poller NO iniciado');
+    firstPollCompleted = true;
   }
 
-  // ---------- 6. Express ----------
+  // ---------- 7. Express ----------
   expressApp = express();
   expressApp.set('trust proxy', 1);
 
@@ -171,14 +425,7 @@ async function start() {
   expressApp.use(compression());
   expressApp.use(express.json({ limit: '256kb' }));
 
-  // Rate limit global
-  const globalLimiter = createRateLimiter({
-    windowMs: env.rateLimitWindowMs,
-    max: env.rateLimitMax,
-  });
-  expressApp.use('/api/', globalLimiter);
-
-  // CORS permisivo para el mundo público
+  // CORS
   expressApp.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
@@ -187,34 +434,141 @@ async function start() {
     next();
   });
 
-  // ---------- 7. HTTP server + WS ----------
+  // Rate limit global /api/*
+  const globalLimiter = createRateLimiter({
+    windowMs: env.rateLimitWindowMs,
+    max: env.rateLimitMax,
+    keyPrefix: 'global',
+  });
+  expressApp.use('/api/', globalLimiter);
+
+  // ---------- 8. HTTP server + WS ----------
   httpServer = http.createServer(expressApp);
   wsServer = createWSServer(httpServer, world);
 
-  // ---------- 8. Rutas ----------
-  // Nota: /api/entities se monta primero porque tiene rutas más específicas.
-  expressApp.use('/api/entities', createEntitiesRouter({ world, wsServer }));
+  // ---------- 9. Rutas ----------
+  const entitiesRouter = createEntitiesRouter({ world, wsServer, ipQuota });
 
-  // Simulate vive dentro de entities.js y ya está montado bajo /api/entities.
-  // Pero queremos exponer /api/simulate y /api/simulate/:id también.
-  // Los añadimos al router principal de API.
+  // Guardas específicas para POST /api/simulate
+  const simulateRateLimiter = createRateLimiter({
+    windowMs: LIMITS.SIMULATE_RATE_WINDOW_MS,
+    max: LIMITS.SIMULATE_RATE_MAX,
+    keyPrefix: 'simulate',
+  });
 
+  // Endpoint para /api/simulate (POST/GET/DELETE)
+  expressApp.all('/api/simulate{/*path}', (req, res, next) => {
+    // Aplica guardas solo a POST
+    if (req.method === 'POST') {
+      return simulateRateLimiter(req, res, (err) => {
+        if (err) return next(err);
+        return globalEntityLimitGuard(req, res, (err2) => {
+          if (err2) return next(err2);
+          return quotaGuard(req, res, (err3) => {
+            if (err3) return next(err3);
+            return labelSanitizer(req, res, (err4) => {
+              if (err4) return next(err4);
+              // Reescribe la URL para que el router la reconozca
+              req.url = req.url.replace(/^\/api\/simulate/, '/simulate');
+              return entitiesRouter(req, res, next);
+            });
+          });
+        });
+      });
+    }
+    // GET, DELETE pasan directo
+    req.url = req.url.replace(/^\/api\/simulate/, '/simulate');
+    return entitiesRouter(req, res, next);
+  });
+
+  // /api/entities/*
+  expressApp.use('/api/entities', entitiesRouter);
+
+  // /api/* genérico
   const apiRouter = createApiRouter({
     world,
     poller,
     wsServer,
     startedAt: STARTED_AT,
+    ipQuota,
+    limits: LIMITS,
   });
-
-  // Alias: /api/simulate → /api/entities/simulate
-  expressApp.post('/api/simulate', (req, res, next) => {
-    req.url = '/simulate';
-    expressApp.handle(req, res, next);
-  });
-
   expressApp.use('/api', apiRouter);
 
-  // ---------- 9. Estáticos ----------
+  // ---------- 10. Endpoint /api/events ----------
+  expressApp.get('/api/events', (req, res) => {
+    try {
+      const limit = clampInt(req.query.limit, 50, 1, 500);
+      const type = typeof req.query.type === 'string'
+        ? req.query.type.slice(0, 60)
+        : null;
+
+      const rows = EventRepo.recent(limit, type);
+      res.json({
+        success: true,
+        count: rows.length,
+        events: rows.map(r => {
+          let payload = null;
+          try { payload = JSON.parse(r.payload_json); } catch (_) {}
+          return {
+            id: r.id,
+            type: r.type,
+            payload,
+            createdAt: r.created_at,
+          };
+        }),
+      });
+    } catch (err) {
+      log.error(`/api/events: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ---------- 11. Endpoint /api/entities/:id/events ----------
+  expressApp.get('/api/entities/:id/events', (req, res) => {
+    try {
+      const id = String(req.params.id).slice(0, 200);
+      const limit = clampInt(req.query.limit, 50, 1, 500);
+
+      // Filtramos eventos que mencionan esta entidad en su payload
+      const rows = EventRepo.recent(500, null);
+      const filtered = [];
+
+      for (const r of rows) {
+        let payload = null;
+        try { payload = JSON.parse(r.payload_json); } catch (_) {}
+        if (!payload) continue;
+
+        const mentions =
+          payload.id === id ||
+          payload.a === id ||
+          payload.b === id ||
+          payload.entityId === id;
+
+        if (mentions) {
+          filtered.push({
+            id: r.id,
+            type: r.type,
+            payload,
+            createdAt: r.created_at,
+          });
+          if (filtered.length >= limit) break;
+        }
+      }
+
+      res.json({
+        success: true,
+        entityId: id,
+        count: filtered.length,
+        events: filtered,
+      });
+    } catch (err) {
+      log.error(`/api/entities/:id/events: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ---------- 12. Estáticos ----------
   expressApp.use(express.static(PUBLIC_DIR, {
     maxAge: env.isProd ? '1h' : 0,
     etag: true,
@@ -244,7 +598,7 @@ async function start() {
     });
   });
 
-  // ---------- 10. Bucle de simulación ----------
+  // ---------- 13. Bucle de simulación ----------
   lastTickAt = Date.now();
   tickTimer = setInterval(() => {
     try {
@@ -258,13 +612,13 @@ async function start() {
   }, env.tickIntervalMs);
   if (tickTimer.unref) tickTimer.unref();
 
-  // ---------- 11. Persistencia periódica ----------
+  // ---------- 14. Persistencia periódica ----------
   snapshotTimer = setInterval(() => {
     persistSafely('periodic');
   }, env.snapshotIntervalMs);
   if (snapshotTimer.unref) snapshotTimer.unref();
 
-  // ---------- 12. Pruning ----------
+  // ---------- 15. Pruning ----------
   pruneTimer = setInterval(() => {
     try {
       EventRepo.prune(env.eventRetention);
@@ -272,10 +626,10 @@ async function start() {
     } catch (err) {
       log.warn(`Prune falló: ${err.message}`);
     }
-  }, 5 * 60 * 1000); // cada 5 min
+  }, 5 * 60 * 1000);
   if (pruneTimer.unref) pruneTimer.unref();
 
-  // ---------- 13. Escuchar ----------
+  // ---------- 16. Escuchar ----------
   await new Promise((resolve) => {
     httpServer.listen(env.port, env.host, () => {
       log.info(`✅ HTTP escuchando en http://${env.host}:${env.port}`);
@@ -285,8 +639,50 @@ async function start() {
     });
   });
 
-  // Banner
   printBanner();
+}
+
+// ============================================================
+// Validaciones de seguridad
+// ============================================================
+
+function validateSecurityConfig() {
+  const errors = [];
+
+  if (env.isProd) {
+    if (!env.worldWsToken) {
+      errors.push(
+        'WORLD_WS_TOKEN es OBLIGATORIO en producción. ' +
+        'El WebSocket público sin auth permite DoS trivial.'
+      );
+    } else if (env.worldWsToken.length < 16) {
+      errors.push('WORLD_WS_TOKEN debe tener al menos 16 caracteres en producción.');
+    }
+
+    if (!env.worldAdminToken) {
+      errors.push(
+        'WORLD_ADMIN_TOKEN es OBLIGATORIO en producción. ' +
+        'Sin él, /api/simulate queda abierto a cualquiera.'
+      );
+    } else if (env.worldAdminToken.length < 16) {
+      errors.push('WORLD_ADMIN_TOKEN debe tener al menos 16 caracteres en producción.');
+    }
+  }
+
+  if (errors.length > 0) {
+    log.error('❌ Errores de seguridad en la configuración:');
+    for (const e of errors) log.error(`   - ${e}`);
+    process.exit(1);
+  }
+
+  if (!env.isProd) {
+    if (!env.worldWsToken) {
+      log.warn('⚠️ WORLD_WS_TOKEN no configurado (modo dev). WS público.');
+    }
+    if (!env.worldAdminToken) {
+      log.warn('⚠️ WORLD_ADMIN_TOKEN no configurado (modo dev). /api/simulate abierto.');
+    }
+  }
 }
 
 // ============================================================
@@ -298,16 +694,13 @@ function persistSafely(reason = 'manual') {
   try {
     const t0 = Date.now();
 
-    // 1. Entidades + relaciones
     const r = persistWorld(world);
 
-    // 2. Eventos drenados (persistimos los pendientes)
     const events = world.drainEvents();
     if (events.length > 0) {
       EventRepo.insertMany(events);
     }
 
-    // 3. Snapshot (opcional, solo cada cierto tiempo)
     if (reason === 'periodic' || reason === 'shutdown') {
       const snap = world.snapshot({ includeRelationships: true });
       SnapshotRepo.insert({
@@ -343,6 +736,7 @@ function seedDemoEntities(world, count) {
     const intent = intents[Math.floor(Math.random() * intents.length)];
     const turnCount = Math.floor(Math.random() * 100) + 5;
     const sentiment = (Math.random() - 0.5) * 1.5;
+
     const topics = [];
     const nTopics = Math.floor(Math.random() * 3) + 1;
     for (let j = 0; j < nTopics; j++) {
@@ -396,8 +790,14 @@ ${line}
    Mundo:         ${world.width}×${world.height}
    Entidades:     ${s.entities.total} (${s.entities.real} reales, ${s.entities.simulated} simuladas)
    Relaciones:    ${s.relationships.total} (${s.relationships.strong} fuertes)
+${line}
+   SEGURIDAD
+${line}
    Admin Token:   ${env.worldAdminToken ? '🔒 configurado' : '⚠️  NO configurado'}
    WS Token:      ${env.worldWsToken ? '🔒 configurado' : '⚠️  público'}
+   Máx total:     ${LIMITS.MAX_TOTAL_ENTITIES} entidades
+   Máx por IP:    ${LIMITS.MAX_SIMULATED_PER_IP} simuladas
+   Rate simulate: ${LIMITS.SIMULATE_RATE_MAX} cada ${LIMITS.SIMULATE_RATE_WINDOW_MS / 1000}s
 ${line}
 `);
 }
@@ -418,28 +818,22 @@ async function shutdown(signal) {
   }, 10000);
   if (timeout.unref) timeout.unref();
 
-  // 1. Detener ticks
   if (tickTimer) clearInterval(tickTimer);
   if (snapshotTimer) clearInterval(snapshotTimer);
   if (pruneTimer) clearInterval(pruneTimer);
 
-  // 2. Detener poller
   if (poller) poller.stop();
 
-  // 3. Persistir estado final
   persistSafely('shutdown');
 
-  // 4. Cerrar WS
   if (wsServer) {
     try { await wsServer.close(); } catch (_) {}
   }
 
-  // 5. Cerrar HTTP
   if (httpServer) {
     await new Promise((resolve) => httpServer.close(resolve));
   }
 
-  // 6. Cerrar DB
   closeDb();
 
   clearTimeout(timeout);
@@ -473,3 +867,13 @@ start().catch((err) => {
   log.error(err.stack);
   process.exit(1);
 });
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function clampInt(v, def, min, max) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, n));
+}
