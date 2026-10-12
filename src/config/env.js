@@ -1,11 +1,11 @@
 // src/config/env.js
 // Carga y valida variables de entorno. Falla temprano si falta algo crítico.
 //
-// CAMBIOS V1.2.0 (LLM + communityProtocol):
-//   - [FEAT] Configuración del diálogo con LLM del Cerebro.
-//   - [FEAT] Configuración del communityProtocol.
-//   - [FEAT] Configuración del cache de diálogos.
-//   - [FIX RENDER] El puerto lee process.env.PORT primero.
+// CAMBIOS V1.3.0:
+//   - [FIX] communityProtocol: ahora usa CEREBRO_PEER_TOKEN (no admin token)
+//     porque el endpoint real es POST /api/peer/inbox que requiere peer token.
+//   - [FEAT] WORLD_PEER_ID: identificador estable del mundo ante el Cerebro.
+//   - [FEAT] COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS: polling de respuestas.
 
 import 'dotenv/config';
 
@@ -49,6 +49,7 @@ export const env = {
   // ---------- Cerebro Digital ----------
   cerebroUrl: (process.env.CEREBRO_URL || 'http://localhost:3000').replace(/\/+$/, ''),
   cerebroAdminToken: process.env.CEREBRO_ADMIN_TOKEN || '',
+  cerebroPeerToken: process.env.CEREBRO_PEER_TOKEN || '',
   cerebroTimeoutMs: toInt(process.env.CEREBRO_TIMEOUT_MS, 8000),
 
   pollInitialDelayMs: toInt(process.env.CEREBRO_INITIAL_DELAY_MS, 30000),
@@ -62,6 +63,7 @@ export const env = {
   // ---------- Autenticación del mundo ----------
   worldAdminToken: process.env.WORLD_ADMIN_TOKEN || '',
   worldWsToken: process.env.WORLD_WS_TOKEN || '',
+  worldPeerId: process.env.WORLD_PEER_ID || 'world_bff',
 
   // ---------- Seguridad y cuotas ----------
   maxTotalEntities: toInt(process.env.MAX_TOTAL_ENTITIES, 500),
@@ -79,9 +81,25 @@ export const env = {
   llmDialogueMaxLines: toInt(process.env.LLM_DIALOGUE_MAX_LINES, 3),
 
   // ---------- communityProtocol ----------
+  // Habilita el envío de encuentros al Cerebro
   communityProtocolEnabled: toBool(process.env.COMMUNITY_PROTOCOL_ENABLED, false),
+
+  // Intervalo entre envíos al Cerebro (evita saturar)
   communityProtocolMinIntervalMs: toInt(process.env.COMMUNITY_PROTOCOL_MIN_INTERVAL_MS, 15000),
-  communityProtocolMessageType: process.env.COMMUNITY_PROTOCOL_MESSAGE_TYPE || 'greeting',
+
+  // Tipo de mensaje por defecto (debe ser uno de los válidos del CommunityProtocol)
+  // Válidos: hello, signature, shared_thought, question, answer, farewell, gift, request
+  communityProtocolMessageType: process.env.COMMUNITY_PROTOCOL_MESSAGE_TYPE || 'shared_thought',
+
+  // Intervalo de polling del outbox del Cerebro (para recoger respuestas)
+  communityProtocolFetchIntervalMs: toInt(
+    process.env.COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS, 15000
+  ),
+
+  // Habilitar el polling de respuestas
+  communityProtocolFetchEnabled: toBool(
+    process.env.COMMUNITY_PROTOCOL_FETCH_ENABLED, true
+  ),
 
   // ---------- Simulación ----------
   tickIntervalMs: toInt(process.env.TICK_INTERVAL_MS, 33),
@@ -140,6 +158,21 @@ if (env.llmDialogueMinIntervalMs < 5000) {
 if (env.llmDialogueMaxLines < 2 || env.llmDialogueMaxLines > 6) {
   errors.push('LLM_DIALOGUE_MAX_LINES debe estar entre 2 y 6.');
 }
+if (env.communityProtocolFetchIntervalMs < 5000) {
+  errors.push('COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS debe ser >= 5000.');
+}
+
+// Valida tipo de mensaje contra la whitelist del CommunityProtocol real
+const VALID_COMMUNITY_TYPES = new Set([
+  'hello', 'signature', 'shared_thought', 'question',
+  'answer', 'farewell', 'gift', 'request',
+]);
+if (!VALID_COMMUNITY_TYPES.has(env.communityProtocolMessageType)) {
+  errors.push(
+    `COMMUNITY_PROTOCOL_MESSAGE_TYPE inválido: "${env.communityProtocolMessageType}". ` +
+    `Válidos: ${Array.from(VALID_COMMUNITY_TYPES).join(', ')}`
+  );
+}
 
 if (errors.length > 0) {
   console.error('\n❌ Errores de configuración:\n');
@@ -168,10 +201,21 @@ if (env.llmDialogueEnabled) {
 }
 
 if (env.communityProtocolEnabled) {
-  console.log(
-    `ℹ️  communityProtocol: ACTIVO · tipo="${env.communityProtocolMessageType}" · ` +
-    `min-interval=${env.communityProtocolMinIntervalMs / 1000}s`
-  );
+  if (!env.cerebroPeerToken) {
+    console.warn(
+      '⚠️  communityProtocol: ACTIVO pero CEREBRO_PEER_TOKEN no está configurado. ' +
+      'Los envíos fallarán con 401.'
+    );
+  } else {
+    console.log(
+      `ℹ️  communityProtocol: ACTIVO · tipo="${env.communityProtocolMessageType}" · ` +
+      `min-interval=${env.communityProtocolMinIntervalMs / 1000}s · ` +
+      `fetch=${env.communityProtocolFetchEnabled ? `${env.communityProtocolFetchIntervalMs / 1000}s` : 'off'} · ` +
+      `peerId="${env.worldPeerId}"`
+    );
+  }
+} else {
+  console.log('ℹ️  communityProtocol: DESACTIVADO');
 }
 
 export default env;
