@@ -1,19 +1,13 @@
 // src/config/env.js
 // Carga y valida variables de entorno. Falla temprano si falta algo crítico.
 //
-// CAMBIOS V1.1.1:
-//   - [FIX RENDER] El puerto lee process.env.PORT primero (Render lo inyecta),
-//     luego BFF_PORT, luego 10000 por defecto.
-//   - [SEC] Añadidas variables: MAX_TOTAL_ENTITIES, MAX_SIMULATED_PER_IP,
-//     SIMULATE_RATE_WINDOW_MS, SIMULATE_RATE_MAX.
-//   - [FIX] La validación fuerte de tokens en prod la hace server.js
-//     (validateSecurityConfig) para loguear con logger en vez de console.
+// CAMBIOS V1.2.0 (LLM + communityProtocol):
+//   - [FEAT] Configuración del diálogo con LLM del Cerebro.
+//   - [FEAT] Configuración del communityProtocol.
+//   - [FEAT] Configuración del cache de diálogos.
+//   - [FIX RENDER] El puerto lee process.env.PORT primero.
 
 import 'dotenv/config';
-
-// ============================================================
-// Helpers de conversión
-// ============================================================
 
 function toInt(v, def) {
   if (v === undefined || v === null || v === '') return def;
@@ -35,23 +29,13 @@ function toBool(v, def) {
   return def;
 }
 
-// ============================================================
-// Entorno
-// ============================================================
-
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 
-// Puerto: Render inyecta PORT, en local usamos BFF_PORT.
-// Prioridad: PORT > BFF_PORT > 10000 (default de Render).
 const resolvedPort = toInt(
   process.env.PORT,
   toInt(process.env.BFF_PORT, 10000),
 );
-
-// ============================================================
-// Env final
-// ============================================================
 
 export const env = {
   // ---------- Servidor ----------
@@ -66,8 +50,14 @@ export const env = {
   cerebroUrl: (process.env.CEREBRO_URL || 'http://localhost:3000').replace(/\/+$/, ''),
   cerebroAdminToken: process.env.CEREBRO_ADMIN_TOKEN || '',
   cerebroTimeoutMs: toInt(process.env.CEREBRO_TIMEOUT_MS, 8000),
-  pollIntervalMs: toInt(process.env.POLL_INTERVAL_MS, 10000),
-  pollSessionsLimit: toInt(process.env.POLL_SESSIONS_LIMIT, 200),
+
+  pollInitialDelayMs: toInt(process.env.CEREBRO_INITIAL_DELAY_MS, 30000),
+  pollIntervalMs: toInt(process.env.CEREBRO_MIN_INTERVAL_MS,
+    toInt(process.env.POLL_INTERVAL_MS, 30000)),
+  pollMaxIntervalMs: toInt(process.env.CEREBRO_MAX_INTERVAL_MS, 300000),
+  pollSessionsLimit: toInt(process.env.CEREBRO_MAX_SESSIONS_PER_POLL,
+    toInt(process.env.POLL_SESSIONS_LIMIT, 50)),
+  pollMaxFullProfiles: toInt(process.env.CEREBRO_MAX_FULL_PROFILES, 3),
 
   // ---------- Autenticación del mundo ----------
   worldAdminToken: process.env.WORLD_ADMIN_TOKEN || '',
@@ -78,6 +68,20 @@ export const env = {
   maxSimulatedPerIp: toInt(process.env.MAX_SIMULATED_PER_IP, 20),
   simulateRateWindowMs: toInt(process.env.SIMULATE_RATE_WINDOW_MS, 60000),
   simulateRateMax: toInt(process.env.SIMULATE_RATE_MAX, 5),
+
+  // ---------- Diálogo con LLM del Cerebro ----------
+  llmDialogueEnabled: toBool(process.env.LLM_DIALOGUE_ENABLED, true),
+  llmDialogueMinIntervalMs: toInt(process.env.LLM_DIALOGUE_MIN_INTERVAL_MS, 30000),
+  llmDialogueTimeoutMs: toInt(process.env.LLM_DIALOGUE_TIMEOUT_MS, 20000),
+  llmDialogueCacheSize: toInt(process.env.LLM_DIALOGUE_CACHE_SIZE, 200),
+  llmDialogueCacheTtlMs: toInt(process.env.LLM_DIALOGUE_CACHE_TTL_MS, 7200000),
+  llmDialogueSessionId: process.env.LLM_DIALOGUE_SESSION_ID || 'world_sim_v1',
+  llmDialogueMaxLines: toInt(process.env.LLM_DIALOGUE_MAX_LINES, 3),
+
+  // ---------- communityProtocol ----------
+  communityProtocolEnabled: toBool(process.env.COMMUNITY_PROTOCOL_ENABLED, false),
+  communityProtocolMinIntervalMs: toInt(process.env.COMMUNITY_PROTOCOL_MIN_INTERVAL_MS, 15000),
+  communityProtocolMessageType: process.env.COMMUNITY_PROTOCOL_MESSAGE_TYPE || 'greeting',
 
   // ---------- Simulación ----------
   tickIntervalMs: toInt(process.env.TICK_INTERVAL_MS, 33),
@@ -111,31 +115,30 @@ export const env = {
   demoMode: toBool(process.env.DEMO_MODE, false),
   demoEntityCount: toInt(process.env.DEMO_ENTITY_COUNT, 12),
 
-  // ---------- Rate limiting global ----------
+  // ---------- Rate limiting global del BFF ----------
   rateLimitWindowMs: toInt(process.env.RATE_LIMIT_WINDOW_MS, 60000),
   rateLimitMax: toInt(process.env.RATE_LIMIT_MAX, 120),
 };
 
 // ============================================================
-// Validación mínima
+// Validación
 // ============================================================
-// La validación fuerte de seguridad (tokens obligatorios en prod)
-// la hace server.js en validateSecurityConfig() para poder loguear
-// con el logger en vez de con console.log directo.
 
 const errors = [];
 
-if (!env.cerebroUrl) {
-  errors.push('CEREBRO_URL es obligatorio.');
+if (!env.cerebroUrl) errors.push('CEREBRO_URL es obligatorio.');
+if (env.maxTotalEntities < 10) errors.push('MAX_TOTAL_ENTITIES debe ser >= 10.');
+if (env.maxSimulatedPerIp < 1) errors.push('MAX_SIMULATED_PER_IP debe ser >= 1.');
+if (env.port < 1 || env.port > 65535) errors.push(`Puerto inválido: ${env.port}`);
+if (env.pollIntervalMs < 5000) errors.push('CEREBRO_MIN_INTERVAL_MS debe ser >= 5000.');
+if (env.pollMaxIntervalMs < env.pollIntervalMs) {
+  errors.push('CEREBRO_MAX_INTERVAL_MS debe ser >= CEREBRO_MIN_INTERVAL_MS.');
 }
-if (env.maxTotalEntities < 10) {
-  errors.push('MAX_TOTAL_ENTITIES debe ser >= 10.');
+if (env.llmDialogueMinIntervalMs < 5000) {
+  errors.push('LLM_DIALOGUE_MIN_INTERVAL_MS debe ser >= 5000.');
 }
-if (env.maxSimulatedPerIp < 1) {
-  errors.push('MAX_SIMULATED_PER_IP debe ser >= 1.');
-}
-if (env.port < 1 || env.port > 65535) {
-  errors.push(`Puerto inválido: ${env.port}`);
+if (env.llmDialogueMaxLines < 2 || env.llmDialogueMaxLines > 6) {
+  errors.push('LLM_DIALOGUE_MAX_LINES debe estar entre 2 y 6.');
 }
 
 if (errors.length > 0) {
@@ -146,19 +149,29 @@ if (errors.length > 0) {
 }
 
 // ============================================================
-// Warnings (solo en dev)
+// Warnings y avisos
 // ============================================================
 
 if (!env.isProd) {
-  if (!env.worldAdminToken) {
-    console.warn('⚠️ WORLD_ADMIN_TOKEN no definido (modo dev). /api/simulate está abierto.');
-  }
-  if (!env.worldWsToken) {
-    console.warn('⚠️ WORLD_WS_TOKEN no definido (modo dev). WebSocket público.');
-  }
-  if (!env.cerebroAdminToken && !env.demoMode) {
-    console.warn('⚠️ CEREBRO_ADMIN_TOKEN no definido. Endpoints admin del Cerebro fallarán.');
-  }
+  if (!env.worldAdminToken) console.warn('⚠️ WORLD_ADMIN_TOKEN no definido (modo dev).');
+  if (!env.worldWsToken) console.warn('⚠️ WORLD_WS_TOKEN no definido (modo dev).');
+}
+
+if (env.llmDialogueEnabled) {
+  console.log(
+    `ℹ️  LLM diálogo: ACTIVO · min-interval=${env.llmDialogueMinIntervalMs / 1000}s · ` +
+    `cache=${env.llmDialogueCacheSize} · TTL=${env.llmDialogueCacheTtlMs / 60000}min · ` +
+    `session="${env.llmDialogueSessionId}"`
+  );
+} else {
+  console.log('ℹ️  LLM diálogo: DESACTIVADO (solo plantillas)');
+}
+
+if (env.communityProtocolEnabled) {
+  console.log(
+    `ℹ️  communityProtocol: ACTIVO · tipo="${env.communityProtocolMessageType}" · ` +
+    `min-interval=${env.communityProtocolMinIntervalMs / 1000}s`
+  );
 }
 
 export default env;
