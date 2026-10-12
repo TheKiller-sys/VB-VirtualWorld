@@ -1,9 +1,8 @@
 // src/config/env.js
 // Carga y valida variables de entorno. Falla temprano si falta algo crítico.
 //
-// CAMBIOS V1.5.0:
-//   - [PERF] wsBroadcastHz por defecto sube de 15 a 30.
-//   - [FEAT] wsFullSnapshotIntervalMs: cada cuánto se manda un snapshot completo.
+// CAMBIOS V1.7.0:
+//   - [FEAT] Soporte para diálogos largos: LLM_DIALOGUE_MAX_LINES acepta 2-12.
 
 import 'dotenv/config';
 
@@ -69,13 +68,14 @@ export const env = {
   simulateRateWindowMs: toInt(process.env.SIMULATE_RATE_WINDOW_MS, 60000),
   simulateRateMax: toInt(process.env.SIMULATE_RATE_MAX, 5),
 
-  // ---------- Diálogo con LLM del Cerebro ----------
+  // ---------- Diálogo con LLM ----------
   llmDialogueEnabled: toBool(process.env.LLM_DIALOGUE_ENABLED, true),
   llmDialogueMinIntervalMs: toInt(process.env.LLM_DIALOGUE_MIN_INTERVAL_MS, 30000),
   llmDialogueTimeoutMs: toInt(process.env.LLM_DIALOGUE_TIMEOUT_MS, 20000),
   llmDialogueCacheSize: toInt(process.env.LLM_DIALOGUE_CACHE_SIZE, 200),
   llmDialogueCacheTtlMs: toInt(process.env.LLM_DIALOGUE_CACHE_TTL_MS, 7200000),
   llmDialogueSessionId: process.env.LLM_DIALOGUE_SESSION_ID || 'world_sim_v1',
+  // Máximo de líneas por diálogo. Ahora soporta hasta 12.
   llmDialogueMaxLines: toInt(process.env.LLM_DIALOGUE_MAX_LINES, 3),
 
   // ---------- communityProtocol ----------
@@ -106,9 +106,7 @@ export const env = {
 
   // ---------- WebSocket ----------
   wsMaxClients: toInt(process.env.WS_MAX_CLIENTS, 100),
-  // Subido de 15 → 30 para tiempo real. Solo enviamos datos ligeros.
   wsBroadcastHz: toInt(process.env.WS_BROADCAST_HZ, 30),
-  // Cada cuánto se manda un snapshot completo (con emoción, traits, etc.)
   wsFullSnapshotIntervalMs: toInt(process.env.WS_FULL_SNAPSHOT_INTERVAL_MS, 3000),
 
   // ---------- Persistencia ----------
@@ -120,7 +118,7 @@ export const env = {
   demoMode: toBool(process.env.DEMO_MODE, false),
   demoEntityCount: toInt(process.env.DEMO_ENTITY_COUNT, 12),
 
-  // ---------- Rate limiting global del BFF ----------
+  // ---------- Rate limiting global ----------
   rateLimitWindowMs: toInt(process.env.RATE_LIMIT_WINDOW_MS, 60000),
   rateLimitMax: toInt(process.env.RATE_LIMIT_MAX, 120),
 };
@@ -142,8 +140,8 @@ if (env.pollMaxIntervalMs < env.pollIntervalMs) {
 if (env.llmDialogueMinIntervalMs < 5000) {
   errors.push('LLM_DIALOGUE_MIN_INTERVAL_MS debe ser >= 5000.');
 }
-if (env.llmDialogueMaxLines < 2 || env.llmDialogueMaxLines > 6) {
-  errors.push('LLM_DIALOGUE_MAX_LINES debe estar entre 2 y 6.');
+if (env.llmDialogueMaxLines < 2 || env.llmDialogueMaxLines > 12) {
+  errors.push('LLM_DIALOGUE_MAX_LINES debe estar entre 2 y 12.');
 }
 if (env.communityProtocolFetchIntervalMs < 5000) {
   errors.push('COMMUNITY_PROTOCOL_FETCH_INTERVAL_MS debe ser >= 5000.');
@@ -174,7 +172,7 @@ if (errors.length > 0) {
 }
 
 // ============================================================
-// Warnings y avisos
+// Warnings
 // ============================================================
 
 if (!env.isProd) {
@@ -185,7 +183,7 @@ if (!env.isProd) {
 if (env.llmDialogueEnabled) {
   console.log(
     `ℹ️  LLM diálogo: ACTIVO · min-interval=${env.llmDialogueMinIntervalMs / 1000}s · ` +
-    `cache=${env.llmDialogueCacheSize} · TTL=${env.llmDialogueCacheTtlMs / 60000}min · ` +
+    `max-lines=${env.llmDialogueMaxLines} · cache=${env.llmDialogueCacheSize} · ` +
     `session="${env.llmDialogueSessionId}"`
   );
 } else {
@@ -194,9 +192,7 @@ if (env.llmDialogueEnabled) {
 
 if (env.communityProtocolEnabled) {
   if (!env.cerebroPeerToken) {
-    console.warn(
-      '⚠️  communityProtocol: ACTIVO pero CEREBRO_PEER_TOKEN no está configurado.'
-    );
+    console.warn('⚠️  communityProtocol: ACTIVO pero CEREBRO_PEER_TOKEN no configurado.');
   } else {
     console.log(
       `ℹ️  communityProtocol: ACTIVO · tipo="${env.communityProtocolMessageType}" · ` +
