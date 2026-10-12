@@ -1,10 +1,11 @@
 // public/world.js
 // Bootstrap del frontend de Cerebro World.
 //
-// CAMBIOS V1.5.0 (tiempo real):
-//   - [PERF] Extrapolación pura: 0ms de latencia percibida.
-//   - [FEAT] Manejo de mensajes 'tick' (light) y 'full'.
-//   - [FEAT] Server actualizado a 30Hz de broadcasts.
+// CAMBIOS V1.6.0:
+//   - [FEAT] Al hacer click en una relación del panel → vista de chat.
+//   - [FEAT] Deep-link: #chat=<idA>:<idB> abre el chat directamente.
+//   - [FEAT] El estado mantiene los diálogos recientes para mostrar el
+//     contador en el HUD.
 
 import { Renderer } from './renderer.js';
 import { Controls } from './controls.js';
@@ -18,7 +19,6 @@ const RECONNECT_MAX_MS = 20000;
 const RECONNECT_JITTER_MS = 500;
 const TOAST_DURATION_MS = 3200;
 
-// Cuánto tiempo podemos extrapolar antes de congelar posición
 const MAX_EXTRAPOLATION_S = 0.5;
 
 // ============================================================
@@ -26,12 +26,8 @@ const MAX_EXTRAPOLATION_S = 0.5;
 // ============================================================
 
 const state = {
-  // Entidades "server truth" (última info del servidor)
   serverEntities: new Map(),
-
-  // Entidades para render (extrapoladas)
   entities: new Map(),
-
   relationships: [],
   particles: [],
 
@@ -58,6 +54,7 @@ const state = {
     simulated: 0,
     relationships: 0,
     strongRelationships: 0,
+    dialogues: 0,
   },
 
   filters: {
@@ -100,18 +97,64 @@ const toast = document.getElementById('toast');
 // ============================================================
 
 const renderer = new Renderer(canvas, state);
+
 const panel = new Panel({
-  onEntityClick: (id) => controls.focusOnEntity(id),
+  onEntityClick: (id) => {
+    controls.focusOnEntity(id);
+  },
 });
 
 const controls = new Controls(canvas, state, {
-  onEntitySelected: (id) => panel.show(id),
-  onBackgroundSelected: () => panel.hide(),
+  onEntitySelected: (id) => {
+    panel.show(id);
+  },
+  onBackgroundSelected: () => {
+    panel.hide();
+  },
 });
 
 controls.attach(renderer, renderer.camera);
 
 window.__world = { state, renderer, controls, panel };
+
+// ============================================================
+// Deep-link: #chat=<idA>:<idB>
+// ============================================================
+
+function checkDeepLink() {
+  const hash = location.hash;
+  if (!hash) return;
+
+  // Soporta #chat=<idA>:<idB>
+  const m = hash.match(/^#chat=([^:]+):(.+)$/);
+  if (m) {
+    const [, idA, idB] = m;
+    if (idA && idB) {
+      setTimeout(() => {
+        controls.focusOnEntity(idA);
+        panel.showDialogue(idA, idB);
+      }, 500);
+      return;
+    }
+  }
+
+  // Soporta #entity=<id>
+  const m2 = hash.match(/^#entity=(.+)$/);
+  if (m2) {
+    const id = m2[1];
+    if (id) {
+      setTimeout(() => {
+        controls.focusOnEntity(id);
+        panel.show(id);
+      }, 500);
+    }
+  }
+}
+
+window.addEventListener('hashchange', () => {
+  // Si el usuario cambia el hash manualmente, aplicamos el deep-link
+  checkDeepLink();
+});
 
 // ============================================================
 // Token del WS
@@ -123,7 +166,7 @@ function loadWsToken() {
   if (fromUrl) {
     try { localStorage.setItem(WS_TOKEN_KEY, fromUrl); } catch (_) {}
     url.searchParams.delete('token');
-    history.replaceState({}, '', url.toString());
+    history.replaceState({}, '', url.toString() + location.hash);
     return fromUrl;
   }
 
@@ -348,10 +391,6 @@ function handleMessage(msg) {
 // Aplicar snapshots
 // ============================================================
 
-/**
- * Snapshot COMPLETO: reemplaza todo.
- * Usado en welcome, cada 3s, y on-demand.
- */
 function applyFullSnapshot(snap) {
   if (!snap || !Array.isArray(snap.entities)) return;
 
@@ -372,22 +411,16 @@ function applyFullSnapshot(snap) {
   updateHudStats(snap);
 }
 
-/**
- * Snapshot LIGERO: solo actualiza posición y velocidad.
- * Los demás campos (emotion, traits, etc.) se conservan del último full.
- */
 function applyLightSnapshot(snap) {
   if (!snap || !Array.isArray(snap.entities)) return;
 
   const now = Date.now();
   const map = state.serverEntities;
-  let matched = 0;
 
   for (const light of snap.entities) {
     const e = map.get(light.id);
     if (!e) continue;
 
-    // Solo actualiza campos que cambian por física
     e.x = light.x;
     e.y = light.y;
     e.vx = light.vx;
@@ -395,10 +428,8 @@ function applyLightSnapshot(snap) {
     e.alpha = light.a;
     e.pulse = light.p;
     e.serverUpdatedAt = now;
-    matched++;
   }
 
-  // Actualiza HUD
   if (snap.tick) {
     statTick.textContent = `tick ${snap.tick}`;
   }
@@ -475,8 +506,39 @@ function applyEvents(events) {
       const p = ev.payload || {};
       if (Array.isArray(p.messages) && p.messages.length > 0) {
         scheduleDialogue(p.messages);
+        state.stats.dialogues++;
+
         if (p.source === 'llm') {
           console.log(`✨ Diálogo LLM: ${shortId(p.a)}↔${shortId(p.b)}`);
+        }
+
+        // Si el panel está mostrando el detalle de A o B,
+        // refrescamos para que aparezca el contador de diálogos actualizado
+        if (panel.mode === 'entity'
+            && (panel.currentId === p.a || panel.currentId === p.b)) {
+          // Debounce: solo refresca si ha pasado 1.5s desde la última
+          if (!applyEvents._refreshTimer) {
+            applyEvents._refreshTimer = setTimeout(() => {
+              applyEvents._refreshTimer = null;
+              if (panel.mode === 'entity' && panel.currentId) {
+                panel.show(panel.currentId);
+              }
+            }, 1500);
+          }
+        }
+
+        // Si el panel está mostrando el chat entre A y B, recargamos
+        if (panel.mode === 'dialogue'
+            && ((panel.currentId === p.a && panel.dialogueWith === p.b)
+             || (panel.currentId === p.b && panel.dialogueWith === p.a))) {
+          if (!applyEvents._refreshChatTimer) {
+            applyEvents._refreshChatTimer = setTimeout(() => {
+              applyEvents._refreshChatTimer = null;
+              if (panel.mode === 'dialogue' && panel.currentId && panel.dialogueWith) {
+                panel.showDialogue(panel.currentId, panel.dialogueWith);
+              }
+            }, 2000);
+          }
         }
       }
     }
@@ -558,16 +620,9 @@ window.__dialogueApi = {
 };
 
 // ============================================================
-// Extrapolación por frame (tiempo real)
+// Extrapolación por frame
 // ============================================================
 
-/**
- * En lugar de interpolar entre snapshots (que añade latencia),
- * extrapolamos desde la última posición conocida usando la
- * velocidad reportada por el servidor.
- *
- * Esto da 0ms de latencia percibida.
- */
 function updateDisplayEntities() {
   const now = Date.now();
   const out = new Map();
@@ -588,7 +643,6 @@ function updateDisplayEntities() {
 
   state.entities = out;
 
-  // Filtrar relaciones por entidades visibles
   state.relationships = (state.relationships || []).filter(
     r => out.has(r.a) && out.has(r.b)
   );
@@ -783,12 +837,15 @@ async function boot() {
 
   requestAnimationFrame(loop);
 
+  // Deep-link después de un pequeño delay para que el WS haya cargado
+  setTimeout(checkDeepLink, 1500);
+
   console.log(
     '%c🌍 Cerebro World',
     'color:#4fc3f7;font-weight:bold;font-size:16px'
   );
   console.log(
-    '%cReal-time: extrapolación pura · 30Hz broadcast · 0ms latencia',
+    '%cReal-time: extrapolación pura · 30Hz broadcast · click en relación para ver el chat',
     'color:#61c9a8;font-size:11px'
   );
 }
