@@ -1,18 +1,14 @@
 // public/world.js
 // Bootstrap del frontend de Cerebro World.
 //
-// CAMBIOS V1.1.0 (endurecimiento + UX):
+// CAMBIOS V1.3.0:
+//   - [FEAT] Handler del evento 'dialogue' → burbujas de texto.
+//   - [FEAT] Gestor de cola de diálogos por entidad.
+//   - [FEAT] Ventana global __dialogueApi para el renderer.
 //   - [SEC] Soporte de WORLD_WS_TOKEN vía ?token= o localStorage.
-//   - [SEC] Prompt al usuario si el WS rechaza por token inválido.
-//   - [SEC] Persiste el token en localStorage tras validación.
-//   - [FEAT] Manejo de errores 429 (quota) y 503 (mundo lleno) con toast.
-//   - [FEAT] HUD ampliado: total, reales, simuladas, límite global.
-//   - [FEAT] Filtros de visualización por emoción y tipo (real/sim).
 //   - [FEAT] Heartbeat cliente-side para detectar conexiones muertas.
 //   - [FIX] controls.attach(renderer, camera) inyectado correctamente.
 //   - [FIX] controls.tickFollow() llamado en cada frame del loop.
-//   - [FIX] Reconexión robusta con backoff exponencial + jitter.
-//   - [FIX] Manejo de visibilidad de pestaña (pausa render si está oculta).
 
 import { Renderer } from './renderer.js';
 import { Controls } from './controls.js';
@@ -31,22 +27,19 @@ const RECONNECT_JITTER_MS = 500;
 const TOAST_DURATION_MS = 3200;
 
 // ============================================================
-// Estado global del frontend
+// Estado global
 // ============================================================
 
 const state = {
-  // Snapshots para interpolación
   prevSnapshot: null,
   currSnapshot: null,
   prevServerTime: 0,
   currServerTime: 0,
 
-  // Estado "vivo" interpolado (recalculado en cada frame)
-  entities: new Map(),       // id → entity interpolada
-  relationships: [],         // [{ a, b, strength }]
-  particles: [],             // partículas efímeras
+  entities: new Map(),
+  relationships: [],
+  particles: [],
 
-  // Config del servidor (cargada de /api/config)
   config: {
     world: {
       width: 2000,
@@ -64,7 +57,6 @@ const state = {
     },
   },
 
-  // Stats agregados (del snapshot)
   stats: {
     total: 0,
     real: 0,
@@ -73,27 +65,24 @@ const state = {
     strongRelationships: 0,
   },
 
-  // Filtros de visualización
   filters: {
-    emotions: new Set(),     // vacío = todas
+    emotions: new Set(),
     showReal: true,
     showSimulated: true,
   },
 
-  // Flags de UI
   options: {
     showRelations: true,
     showLabels: true,
     showTrails: false,
+    showDialogues: true,
   },
 
-  // Conexión
-  wsStatus: 'connecting',    // connecting | connected | disconnected | error | unauthorized
+  wsStatus: 'connecting',
   wsToken: null,
   lastEventAt: 0,
   lastPongAt: 0,
 
-  // Control de render
   isTabVisible: true,
 };
 
@@ -124,7 +113,7 @@ const controls = new Controls(canvas, state, {
   onBackgroundSelected: () => panel.hide(),
 });
 
-// FIX: inyecta renderer y camera en controls
+// Inyecta renderer y camera en controls
 controls.attach(renderer, renderer.camera);
 
 // Debug
@@ -135,18 +124,15 @@ window.__world = { state, renderer, controls, panel };
 // ============================================================
 
 function loadWsToken() {
-  // 1. Query param
   const url = new URL(location.href);
   const fromUrl = url.searchParams.get('token');
   if (fromUrl) {
     try { localStorage.setItem(WS_TOKEN_KEY, fromUrl); } catch (_) {}
-    // Limpia de la URL para no dejarlo en el historial
     url.searchParams.delete('token');
     history.replaceState({}, '', url.toString());
     return fromUrl;
   }
 
-  // 2. localStorage
   try {
     const fromStorage = localStorage.getItem(WS_TOKEN_KEY);
     if (fromStorage) return fromStorage;
@@ -181,7 +167,6 @@ function connectWS() {
     reconnectTimer = null;
   }
 
-  // Construye URL
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = new URL(`${proto}://${location.host}/ws`);
   if (state.wsToken) url.searchParams.set('token', state.wsToken);
@@ -208,15 +193,13 @@ function connectWS() {
     stopHeartbeat();
 
     if (ev.code === 4001) {
-      // Token inválido
       setWsStatus('unauthorized');
       clearWsToken();
       promptForToken();
-      return; // no reconectar automáticamente
+      return;
     }
 
     if (ev.code === 1013) {
-      // Demasiados clientes
       setWsStatus('disconnected');
       showToast('Servidor lleno, reintentando…', 'error');
       scheduleReconnect();
@@ -258,7 +241,6 @@ function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    // Si no hemos recibido pong en HEARTBEAT_TIMEOUT_MS, cierra
     const since = Date.now() - lastPongReceivedAt;
     if (since > HEARTBEAT_TIMEOUT_MS) {
       console.warn('[WS] heartbeat timeout, cerrando conexión');
@@ -266,7 +248,6 @@ function startHeartbeat() {
       return;
     }
 
-    // Envía ping
     try {
       ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
     } catch (_) {}
@@ -287,7 +268,6 @@ function stopHeartbeat() {
 // ============================================================
 
 function promptForToken() {
-  // Si ya estamos en una situación de prompt, evita duplicados
   if (promptForToken._active) return;
   promptForToken._active = true;
 
@@ -315,7 +295,6 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'welcome':
       applySnapshot(msg.snapshot);
-      // Actualiza stats si vienen en el welcome
       if (msg.serverTime) {
         state.lastEventAt = msg.serverTime;
       }
@@ -338,7 +317,6 @@ function handleMessage(msg) {
       if (msg.entity) {
         const isSim = msg.entity.isSimulated ? '(simulada) ' : '';
         showToast(`🌱 Nueva entidad ${isSim}${shortId(msg.entity.id)}`, 'success');
-        // Si el panel está mostrando esa entidad, refresca
         if (panel.currentId === msg.entity.id) {
           panel.show(msg.entity.id);
         }
@@ -361,7 +339,6 @@ function handleMessage(msg) {
       break;
 
     case 'stats':
-      // Opcional: el servidor puede mandar stats periódicas
       break;
 
     case 'error':
@@ -380,7 +357,6 @@ function handleMessage(msg) {
 function applySnapshot(snap) {
   if (!snap || !Array.isArray(snap.entities)) return;
 
-  // Guarda para interpolación
   state.prevSnapshot = state.currSnapshot;
   state.prevServerTime = state.currServerTime;
   state.currSnapshot = snap;
@@ -391,7 +367,6 @@ function applySnapshot(snap) {
     state.prevServerTime = state.prevServerTime || state.currServerTime;
   }
 
-  // Actualiza stats del HUD
   updateHudStats(snap);
 }
 
@@ -412,7 +387,6 @@ function updateHudStats(snap) {
   state.stats.strongRelationships = (snap.relationships || [])
     .filter(r => r.strength >= 0.6).length;
 
-  // Actualiza DOM
   const max = state.config.security?.maxTotalEntities;
   if (max) {
     statEntities.textContent = `${state.stats.total}/${max} entidades (${real}R · ${simulated}S)`;
@@ -425,7 +399,7 @@ function updateHudStats(snap) {
 }
 
 // ============================================================
-// Eventos puntuales → partículas
+// Eventos puntuales → partículas y diálogos
 // ============================================================
 
 function applyEvents(events) {
@@ -457,7 +431,6 @@ function applyEvents(events) {
         bornAt: performance.now(),
       });
     } else if (ev.type === 'entity_died') {
-      // Pequeña nube gris en la posición (si la conocemos)
       const e = state.entities.get(ev.payload?.id);
       if (e) {
         state.particles.push({
@@ -471,6 +444,14 @@ function applyEvents(events) {
           bornAt: performance.now(),
         });
       }
+    } else if (ev.type === 'dialogue') {
+      const p = ev.payload || {};
+      if (Array.isArray(p.messages) && p.messages.length > 0) {
+        scheduleDialogue(p.messages);
+        if (p.source === 'llm') {
+          console.log(`✨ Diálogo LLM: ${shortId(p.a)}↔${shortId(p.b)}`);
+        }
+      }
     }
   }
 
@@ -478,6 +459,84 @@ function applyEvents(events) {
     state.particles.splice(0, state.particles.length - 200);
   }
 }
+
+// ============================================================
+// Sistema de diálogo (burbujas)
+// ============================================================
+
+const dialogueQueues = new Map();
+const MAX_QUEUE_PER_ENTITY = 5;
+const MAX_DIALOGUE_AGE_MS = 30000;
+
+function scheduleDialogue(messages) {
+  const now = performance.now();
+
+  for (const msg of messages) {
+    if (!msg || !msg.entityId || !msg.text) continue;
+
+    const showAt = now + (msg.delayMs || 0);
+    const durationMs = msg.durationMs || 3500;
+    const hideAt = showAt + durationMs;
+
+    let queue = dialogueQueues.get(msg.entityId);
+    if (!queue) {
+      queue = [];
+      dialogueQueues.set(msg.entityId, queue);
+    }
+
+    if (queue.length >= MAX_QUEUE_PER_ENTITY) {
+      queue.shift();
+    }
+
+    queue.push({
+      text: String(msg.text).slice(0, 200),
+      showAt,
+      hideAt,
+      bornAt: showAt,
+    });
+  }
+}
+
+function getActiveDialogue(entityId, now) {
+  const queue = dialogueQueues.get(entityId);
+  if (!queue || queue.length === 0) return null;
+
+  while (queue.length > 0 && queue[0].hideAt < now) {
+    queue.shift();
+  }
+
+  if (queue.length === 0) {
+    dialogueQueues.delete(entityId);
+    return null;
+  }
+
+  const head = queue[0];
+  if (head.showAt > now) return null;
+
+  return head;
+}
+
+function cleanupDialogues(now) {
+  for (const [id, queue] of dialogueQueues) {
+    while (queue.length > 0 && queue[0].hideAt < now) {
+      queue.shift();
+    }
+    if (queue.length === 0) {
+      dialogueQueues.delete(id);
+    }
+  }
+}
+
+// API global para el renderer
+window.__dialogueApi = {
+  getActiveDialogue,
+  getQueue: (id) => dialogueQueues.get(id) || [],
+  getStats: () => ({
+    entitiesWithDialogue: dialogueQueues.size,
+    totalQueued: Array.from(dialogueQueues.values())
+      .reduce((s, q) => s + q.length, 0),
+  }),
+};
 
 // ============================================================
 // Interpolación por frame
@@ -488,7 +547,6 @@ function interpolateEntities() {
   const curr = state.currSnapshot;
   if (!curr) return;
 
-  // t = cuánto tiempo ha pasado desde curr, en unidades del intervalo
   const interval = Math.max(1, state.currServerTime - state.prevServerTime);
   const elapsed = Date.now() - state.currServerTime;
   let t = elapsed / interval;
@@ -504,7 +562,6 @@ function interpolateEntities() {
   const filters = state.filters;
 
   for (const e of curr.entities) {
-    // Aplica filtros
     if (!passesFilter(e, filters)) continue;
 
     const p = prevMap.get(e.id);
@@ -529,7 +586,6 @@ function interpolateEntities() {
 
   state.entities = out;
 
-  // Filtra relaciones por entidades visibles
   const rels = curr.relationships || [];
   state.relationships = rels.filter(r => out.has(r.a) && out.has(r.b));
 }
@@ -546,12 +602,12 @@ function passesFilter(e, filters) {
 // ============================================================
 
 let lastFrameAt = performance.now();
+let lastCleanupAt = 0;
 
 function loop(now) {
   const dt = Math.min(0.1, (now - lastFrameAt) / 1000);
   lastFrameAt = now;
 
-  // Si la pestaña está oculta, solo mantén el loop sin renderizar
   if (!state.isTabVisible) {
     requestAnimationFrame(loop);
     return;
@@ -560,7 +616,12 @@ function loop(now) {
   interpolateEntities();
   updateParticles(dt);
 
-  // Cámara sigue a la entidad seleccionada (si hay)
+  // Cleanup de diálogos expirados cada 2s
+  if (now - lastCleanupAt > 2000) {
+    cleanupDialogues(now);
+    lastCleanupAt = now;
+  }
+
   controls.tickFollow();
 
   renderer.render(dt);
@@ -594,9 +655,7 @@ document.addEventListener('visibilitychange', () => {
   state.isTabVisible = !document.hidden;
 
   if (state.isTabVisible) {
-    // Al volver, resetea el reloj para evitar saltos de interpolación
     lastFrameAt = performance.now();
-    // Pide un snapshot fresco
     if (ws && ws.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify({ type: 'snapshot' })); } catch (_) {}
     }
@@ -649,7 +708,6 @@ function buildLegend() {
     `</div>`
   )).join('');
 
-  // Click en leyenda = filtro toggle
   legendGrid.querySelectorAll('[data-emotion]').forEach(el => {
     el.style.cursor = 'pointer';
     el.style.opacity = '1';
@@ -681,7 +739,6 @@ async function loadConfig() {
 
     if (data?.config) {
       state.config = { ...state.config, ...data.config };
-      // Merge profundo del sub-objeto world
       if (data.config.world) {
         state.config.world = { ...state.config.world, ...data.config.world };
       }
@@ -693,7 +750,6 @@ async function loadConfig() {
     console.warn('[config] no se pudo cargar:', err.message);
   }
 
-  // Extrae el token requerido
   state.config.requiresWsToken = !!state.config.requiresWsToken;
   if (state.config.requiresWsToken && !state.wsToken) {
     promptForToken();
@@ -714,27 +770,20 @@ function shortId(id) {
 // ============================================================
 
 async function boot() {
-  // 1. Token primero (puede venir de URL)
   state.wsToken = loadWsToken();
 
-  // 2. Config del servidor
   await loadConfig();
 
-  // 3. Leyenda
   buildLegend();
 
-  // 4. Conectar WS
   if (state.config.requiresWsToken && !state.wsToken) {
-    // promptForToken ya se habrá llamado en loadConfig
     setWsStatus('unauthorized');
   } else {
     connectWS();
   }
 
-  // 5. Loop de render
   requestAnimationFrame(loop);
 
-  // 6. Banner
   console.log(
     '%c🌍 Cerebro World',
     'color:#4fc3f7;font-weight:bold;font-size:16px'
