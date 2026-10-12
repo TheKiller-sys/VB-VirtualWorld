@@ -1,18 +1,14 @@
 // src/routes/api.js
 // Rutas de información general del mundo: health, world snapshot, stats, config.
 //
-// CAMBIOS V1.1.0:
-//   - [FIX] Eliminado el require() roto en /api/events (ahora está en server.js).
-//   - [SEC] Acepta ipQuota y limits para exponerlos en /health, /stats, /config.
-//   - [FEAT] /config expone security.maxTotalEntities y maxSimulatedPerIp
-//            (para que el frontend pinte "X/Y entidades" en el HUD).
-//   - [FEAT] /health reporta cuota y límites.
-//   - [FEAT] Nuevo GET /recent-events (últimos N eventos sin paginación compleja).
+// CAMBIOS V1.6.0:
+//   - [FEAT] /stats incluye dialogueCount.
+//   - [FEAT] /health expone dialogues en db.
 
 import { Router } from 'express';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { pingCerebro } from '../cerebro/client.js';
-import { getDbStats, EventRepo } from '../persistence/repository.js';
+import { getDbStats, EventRepo, DialogueRepo } from '../persistence/repository.js';
 import { env } from '../config/env.js';
 
 export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, limits }) {
@@ -31,7 +27,7 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
     res.json({
       ok: true,
       service: 'cerebro-world',
-      version: '1.1.0',
+      version: '1.6.0',
       uptimeSec,
       now: Date.now(),
       environment: env.nodeEnv,
@@ -65,7 +61,6 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
 
   // ------------------------------------------------------------
   // GET /world
-  // Snapshot completo del mundo (para polling manual sin WS)
   // ------------------------------------------------------------
   router.get('/world', (req, res) => {
     res.json({
@@ -76,13 +71,14 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
 
   // ------------------------------------------------------------
   // GET /stats
-  // Métricas agregadas del mundo
   // ------------------------------------------------------------
   router.get('/stats', (req, res) => {
+    const dbStats = safeDbStats();
+
     res.json({
       success: true,
       stats: world.getStats(),
-      db: safeDbStats(),
+      db: dbStats,
       ws: wsServer.getStats(),
       poller: poller.getState(),
       quota: ipQuota?.getStats?.() || null,
@@ -95,7 +91,6 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
 
   // ------------------------------------------------------------
   // GET /config
-  // Configuración no sensible para el frontend
   // ------------------------------------------------------------
   router.get('/config', (req, res) => {
     res.json({
@@ -123,7 +118,6 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
 
   // ------------------------------------------------------------
   // GET /recent-events
-  // Últimos eventos (wrapper simple de EventRepo)
   // ------------------------------------------------------------
   router.get('/recent-events', (req, res) => {
     try {
@@ -146,6 +140,20 @@ export function createApiRouter({ world, poller, wsServer, startedAt, ipQuota, l
       });
 
       res.json({ success: true, count: events.length, events });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // GET /recent-dialogues
+  // Últimos diálogos globales (para un feed público opcional).
+  // ------------------------------------------------------------
+  router.get('/recent-dialogues', (req, res) => {
+    try {
+      const limit = clampInt(req.query.limit, 30, 1, 200);
+      const rows = DialogueRepo.recent ? DialogueRepo.recent(limit) : [];
+      res.json({ success: true, count: rows.length, dialogues: rows });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
