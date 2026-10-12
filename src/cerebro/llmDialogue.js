@@ -1,11 +1,12 @@
 // src/cerebro/llmDialogue.js
 // Genera diálogos entre entidades usando el LLM del Cerebro.
 //
-// CAMBIOS V3.1.0 (diálogos largos):
-//   - [FEAT] Soporte para hasta 12 líneas por diálogo.
-//   - [FEAT] Prompt adaptativo según la fase (apertura / desarrollo / cierre).
-//   - [FEAT] Delays ajustados según la posición y longitud total.
-//   - [FEAT] Contexto acumulado con resumen del hilo (evita repeticiones).
+// CAMBIOS V3.2.0 (FIX CRÍTICO):
+//   - [FIX] El rate limit se aplica SOLO al inicio de un diálogo.
+//     Antes, cada línea volvía a chequear el rate limit y cortaba
+//     el diálogo tras la primera línea ("LLM solo dio 1 línea(s)").
+//   - [FIX] Ahora las N líneas de un mismo diálogo se generan sin
+//     esperar el intervalo entre llamadas (solo una pequeña pausa).
 
 import { callCerebro } from './client.js';
 import { env } from '../config/env.js';
@@ -36,9 +37,13 @@ const state = {
 };
 
 // ============================================================
-// API
+// API pública
 // ============================================================
 
+/**
+ * ¿Podemos INICIAR un nuevo diálogo ahora mismo?
+ * Aplica el rate limit global (LLM_DIALOGUE_MIN_INTERVAL_MS).
+ */
 export function canCallLLM() {
   if (!env.llmDialogueEnabled) return false;
   if (state.inFlight) return false;
@@ -48,10 +53,21 @@ export function canCallLLM() {
 }
 
 /**
+ * ¿Podemos seguir haciendo llamadas DENTRO de un diálogo?
+ * No aplica el rate limit global, solo el circuit breaker.
+ */
+function canContinueDialogue() {
+  if (!env.llmDialogueEnabled) return false;
+  if (Date.now() < state.blockedUntil) return false;
+  return true;
+}
+
+/**
  * Genera un diálogo entre dos entidades usando el LLM del Cerebro.
  * @returns {Promise<Array<{entityId, text, delayMs, durationMs}>|null>}
  */
 export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
+  // Chequeo de rate limit SOLO al inicio
   if (!canCallLLM()) {
     state.totalSkipped++;
     return null;
@@ -63,11 +79,9 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
   const t0 = Date.now();
   const messages = [];
 
-  // Decide quién habla primero: la de mayor intensidad
   let currentSpeaker = (a.intensity || 0) >= (b.intensity || 0) ? a : b;
   let otherSpeaker = currentSpeaker === a ? b : a;
 
-  // Cuántas líneas
   const targetLines = computeTargetLines(a, b);
 
   log.debug(
@@ -77,12 +91,14 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
   let accumulatedDelay = 0;
 
   for (let i = 0; i < targetLines; i++) {
-    if (!canCallLLM() && i > 0) {
-      log.debug(`LLM no disponible en línea ${i + 1}, cortando aquí`);
+    // ✅ Uso canContinueDialogue() en vez de canCallLLM()
+    // Ya pasamos el rate limit al entrar; dentro solo chequeamos
+    // el circuit breaker (429, errores consecutivos).
+    if (i > 0 && !canContinueDialogue()) {
+      log.debug(`Circuit breaker activo en línea ${i + 1}, cortando`);
       break;
     }
 
-    state.lastCallAt = Date.now();
     state.totalCalls++;
 
     try {
@@ -107,11 +123,13 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
       const text = cleanLine(raw);
 
       if (!text) {
-        log.debug(`Línea ${i + 1} vacía tras limpiar`);
-        break;
+        log.debug(`Línea ${i + 1} vacía tras limpiar. Raw: "${raw.slice(0, 100)}"`);
+        // No cortamos — intentamos la siguiente
+        [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
+        continue;
       }
 
-      // Anti-repetición: no queremos la misma frase 2 veces seguidas
+      // Anti-repetición
       const lastFromThisSpeaker = messages
         .slice()
         .reverse()
@@ -120,16 +138,13 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
       if (lastFromThisSpeaker &&
           normalizeForCompare(lastFromThisSpeaker.text) === normalizeForCompare(text)) {
         log.debug(`Línea ${i + 1} repetida, saltando`);
-        // No añadimos, pero alternamos y seguimos
         [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
         continue;
       }
 
       state.totalLines++;
 
-      // Delay: depende de la posición
       if (messages.length > 0) {
-        // Delays más largos al principio, más cortos al final (natural)
         const baseDelay = 1100;
         const jitter = Math.random() * 800;
         const positionFactor = i < 2 ? 1.3 : (i >= targetLines - 2 ? 0.85 : 1.0);
@@ -151,9 +166,8 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 
       [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
 
-      // Pausa entre llamadas para no saturar el Cerebro
+      // Pausa corta entre llamadas (no es rate limit, solo cortesía)
       if (i < targetLines - 1) {
-        // Pausa proporcional: más larga si quedan muchas líneas
         const pauseMs = 350 + Math.random() * 200;
         await sleep(pauseMs);
       }
@@ -221,22 +235,18 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 function computeTargetLines(a, b) {
   const maxLines = Math.max(2, Math.min(12, env.llmDialogueMaxLines));
 
-  // Base: 3-5 según similitud
   const sim = a.similarityTo ? a.similarityTo(b) : 0.5;
   let lines = 3 + Math.round(sim * 2);
 
-  // Bonus: si alguna tiene topics ricos, +1
   if ((a.topics?.length || 0) + (b.topics?.length || 0) >= 4) {
     lines += 1;
   }
 
-  // Bonus: si son emociones intensas (ira, miedo, nostalgia)
   const intenseEmotions = new Set(['ira', 'miedo', 'nostalgia', 'ansiedad']);
   if (intenseEmotions.has(a.dominantEmotion) || intenseEmotions.has(b.dominantEmotion)) {
     lines += 1;
   }
 
-  // Penalización: si ambas están en calma/neutral, más cortas
   if (a.dominantEmotion === 'calma' && b.dominantEmotion === 'calma') {
     lines = Math.max(2, lines - 1);
   }
@@ -245,14 +255,13 @@ function computeTargetLines(a, b) {
 }
 
 // ============================================================
-// Prompt por línea (adaptativo según fase)
+// Prompt por línea
 // ============================================================
 
 function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex, totalLines }) {
   const speakerDesc = describeEntity(speaker);
   const otherDesc = describeEntity(other);
 
-  // Contexto: qué se han dicho hasta ahora
   const contextNow = previousMessages.length > 0
     ? previousMessages.map(m => {
         const who = m.entityId === speaker.id ? 'TÚ' : 'LA OTRA ENTIDAD';
@@ -260,10 +269,8 @@ function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex,
       }).join('\n')
     : '(esta es tu primera frase de la conversación)';
 
-  // Contexto: conversaciones previas
   const contextPast = formatPastHistory(history, speaker, other);
 
-  // Fase de la conversación
   const progress = totalLines > 1 ? lineIndex / (totalLines - 1) : 0;
 
   let phaseName, phaseInstruction;
@@ -287,9 +294,7 @@ function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex,
     `${speakerDesc}\n\n` +
     `═══ LA OTRA ENTIDAD ═══\n` +
     `${otherDesc}\n\n` +
-    (contextPast
-      ? `═══ HISTORIAL CON ESTA ENTIDAD ═══\n${contextPast}\n\n`
-      : '') +
+    (contextPast ? `═══ HISTORIAL CON ESTA ENTIDAD ═══\n${contextPast}\n\n` : '') +
     `═══ CONVERSACIÓN ACTUAL (línea ${lineIndex + 1} de ${totalLines}) ═══\n` +
     `${contextNow}\n\n` +
     `═══ TU TURNO — FASE: ${phaseName} ═══\n` +
@@ -340,26 +345,18 @@ function cleanLine(raw) {
 
   let text = String(raw).trim();
 
-  // Toma solo la primera línea útil
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (lines.length === 0) return '';
   text = lines[0];
 
-  // Quita prefijos tipo "A:", "TÚ:", "RESPUESTA:", etc.
   text = text.replace(
     /^(?:[A-ZÁÉÍÓÚ][A-ZÁÉÍÓÚ]*|[A-Z]|TÚ|YO|RESPUESTA|FRASE|DIÁLOGO|TEXTO)\s*[:)\-]\s*/i,
     ''
   );
   text = text.replace(/^[ABab]\s*[:)\-]\s*/, '');
-
-  // Quita comillas envolventes
   text = text.replace(/^["'«»“”‘’]+|["'«»“”‘’]+$/g, '');
-
-  // Quita markdown
   text = text.replace(/^\*+|\*+$/g, '');
   text = text.replace(/^_+|_+$/g, '');
-
-  // Colapsa espacios
   text = text.replace(/\s+/g, ' ').trim();
 
   return text;
