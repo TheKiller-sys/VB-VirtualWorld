@@ -46,6 +46,12 @@ export const env = {
   worldAdminToken: process.env.WORLD_ADMIN_TOKEN || '',
   worldWsToken: process.env.WORLD_WS_TOKEN || '',
 
+  // Seguridad y cuotas
+  maxTotalEntities: toInt(process.env.MAX_TOTAL_ENTITIES, 500),
+  maxSimulatedPerIp: toInt(process.env.MAX_SIMULATED_PER_IP, 20),
+  simulateRateWindowMs: toInt(process.env.SIMULATE_RATE_WINDOW_MS, 60000),
+  simulateRateMax: toInt(process.env.SIMULATE_RATE_MAX, 5),
+
   // Simulación
   tickIntervalMs: toInt(process.env.TICK_INTERVAL_MS, 33),
   world: {
@@ -83,17 +89,20 @@ export const env = {
   rateLimitMax: toInt(process.env.RATE_LIMIT_MAX, 120),
 };
 
-// ---------- Validación ----------
+// ---------- Validación mínima ----------
+// La validación fuerte de seguridad (tokens en prod) la hace server.js
+// en validateSecurityConfig() para poder loguear con logger en vez de console.
+
 const errors = [];
 
-if (env.isProd && !env.worldAdminToken) {
-  errors.push('WORLD_ADMIN_TOKEN es obligatorio en NODE_ENV=production.');
-}
-if (env.isProd && env.worldAdminToken && env.worldAdminToken.length < 16) {
-  errors.push('WORLD_ADMIN_TOKEN debe tener al menos 16 caracteres en producción.');
-}
 if (!env.cerebroUrl) {
   errors.push('CEREBRO_URL es obligatorio.');
+}
+if (env.maxTotalEntities < 10) {
+  errors.push('MAX_TOTAL_ENTITIES debe ser >= 10.');
+}
+if (env.maxSimulatedPerIp < 1) {
+  errors.push('MAX_SIMULATED_PER_IP debe ser >= 1.');
 }
 
 if (errors.length > 0) {
@@ -106,6 +115,9 @@ if (errors.length > 0) {
 // ---------- Warnings ----------
 if (!env.isProd && !env.worldAdminToken) {
   console.warn('⚠️ WORLD_ADMIN_TOKEN no definido (modo dev). /api/simulate está abierto.');
+}
+if (!env.isProd && !env.worldWsToken) {
+  console.warn('⚠️ WORLD_WS_TOKEN no definido (modo dev). WebSocket público.');
 }
 if (!env.cerebroAdminToken && !env.demoMode) {
   console.warn('⚠️ CEREBRO_ADMIN_TOKEN no definido. Endpoints admin del Cerebro fallarán.');
