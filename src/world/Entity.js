@@ -1,5 +1,8 @@
 // src/world/Entity.js
 // Entidad viva del mundo. Puede ser real (chatID del Cerebro) o simulada.
+//
+// CAMBIOS V1.2.0:
+//   - [FEAT] Campos de diálogo: lastDialogueAt, lastDialoguePartnerId.
 
 const EMOTION_PALETTE = Object.freeze({
   alegria:    '#f6c453',
@@ -73,6 +76,10 @@ export class Entity {
     }
     this.lastInteractionAt = Number(profile.lastInteractionAt) || 0;
     this.interactionCount = Number(profile.interactionCount) || 0;
+
+    // ---------- Diálogo ----------
+    this.lastDialogueAt = Number(profile.lastDialogueAt) || 0;
+    this.lastDialoguePartnerId = profile.lastDialoguePartnerId || null;
   }
 
   // ------------------------------------------------------------
@@ -87,9 +94,6 @@ export class Entity {
     return this.ageMs() > timeoutMs;
   }
 
-  // ------------------------------------------------------------
-  // Similitud entre dos entidades (0..1)
-  // ------------------------------------------------------------
   similarityTo(other) {
     if (!other) return 0;
     let sum = 0;
@@ -100,9 +104,7 @@ export class Entity {
       sum += 1 - Math.abs(a - b);
       n++;
     }
-    // Bonus por compartir intent dominante
     const intentBonus = this.dominantIntent === other.dominantIntent ? 0.1 : 0;
-    // Bonus por topics compartidos
     const sharedTopics = this._countSharedTopics(other);
     const topicBonus = Math.min(0.15, sharedTopics * 0.05);
 
@@ -118,9 +120,6 @@ export class Entity {
     return c;
   }
 
-  // ------------------------------------------------------------
-  // Actualización desde un perfil nuevo
-  // ------------------------------------------------------------
   updateFromProfile(profile) {
     const prevEmotion = this.dominantEmotion;
     this.lastSeenAt = Number(profile.lastSeenAt) || Date.now();
@@ -139,7 +138,6 @@ export class Entity {
     this.color = EMOTION_PALETTE[this.dominantEmotion] || EMOTION_PALETTE.neutral;
     this.radius = computeRadius(this.turnCount, this.intensity);
 
-    // Reactivar si estaba desvaneciéndose
     if (this.fading) {
       this.fading = false;
       this.alpha = 0.3;
@@ -148,17 +146,13 @@ export class Entity {
       this.alpha = Math.min(1, this.alpha + 0.15);
     }
 
-    // Si cambió de emoción, un pequeño pulso visual
     if (prevEmotion !== this.dominantEmotion) {
       this.pulse = Math.max(this.pulse, 0.6);
     }
   }
 
-  // ------------------------------------------------------------
-  // Fade por inactividad
-  // ------------------------------------------------------------
   tickFade(dt, world) {
-    if (this.isSimulated) return; // simuladas no expiran solas
+    if (this.isSimulated) return;
     if (this.dead) return;
 
     if (this.isStale(world.entityTimeoutMs)) {
@@ -174,9 +168,6 @@ export class Entity {
     }
   }
 
-  // ------------------------------------------------------------
-  // Relaciones
-  // ------------------------------------------------------------
   reinforceRelationship(otherId, delta) {
     const prev = this.relationships.get(otherId) || 0;
     const next = clamp(prev + delta, 0, 1);
@@ -207,6 +198,7 @@ export class Entity {
   // ------------------------------------------------------------
   // Serialización
   // ------------------------------------------------------------
+
   toJSON() {
     return {
       id: this.id,
