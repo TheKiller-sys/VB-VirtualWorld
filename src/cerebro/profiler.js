@@ -1,34 +1,61 @@
 // src/cerebro/profiler.js
 // Construye un "perfil de entidad" a partir de una sesión del Cerebro.
-// El Cerebro NO expone estado por sesión directamente, así que combinamos
-// session/list + historial + topics.
+//
+// CAMBIOS V1.1.2 (fix 429):
+//   - [PERF] History limit reducido de 50 a 20 turnos.
+//   - [PERF] Topics solo se piden si el historial tuvo éxito.
+//   - [PERF] Retries deshabilitados (el poller ya maneja backoff global).
+//   - [PERF] Timeouts más cortos (3s en vez de 5s).
+//   - [FEAT] Exporta buildProfileFromMeta() para el modo "ligero"
+//     (sin historial): solo metadatos de /session/list.
 
 import { callCerebro } from './client.js';
 import { logger } from '../utils/logger.js';
 
 const log = logger.child('profiler');
 
-const HISTORY_LIMIT = 50;
+const HISTORY_LIMIT = 20;   // bajado de 50 → menos carga por request
 const TOPICS_LIMIT = 6;
+const TIMEOUT_MS = 3000;    // bajado de 5000
 
 /**
- * Construye el perfil de una entidad desde el meta de sesión.
- * @param {object} sessionMeta  fila de /api/session/list
- * @returns {object|null}       perfil listo para World.upsertEntity
+ * Perfil "completo" con historial + topics.
+ * Usado para sesiones nuevas o que cambiaron.
  */
 export async function buildProfile(sessionMeta) {
   if (!sessionMeta || !sessionMeta.sessionId) return null;
 
   const id = String(sessionMeta.sessionId);
 
-  // Enriquecimiento en paralelo, tolerante a fallos
-  const [turns, topics] = await Promise.all([
-    fetchHistory(id).catch(err => {
-      log.warn(`Historial ${id.slice(-8)} falló: ${err.message}`);
-      return [];
-    }),
-    fetchTopics(id).catch(() => []),
-  ]);
+  // 1. Historial primero (es lo importante)
+  let turns = [];
+  try {
+    const h = await callCerebro('sessionHistory', {
+      query: { limit: HISTORY_LIMIT },
+      sessionId: id,
+      timeoutMs: TIMEOUT_MS,
+      retries: 1,  // 1 retry local, el poller ya tiene backoff global
+    });
+    turns = Array.isArray(h?.turns) ? h.turns : [];
+  } catch (err) {
+    // Si falla el historial, caemos al perfil ligero
+    log.debug(`Historial ${id.slice(-8)} falló: ${err.message}`);
+    return buildProfileFromMeta(sessionMeta);
+  }
+
+  // 2. Topics solo si el historial fue OK
+  let topics = [];
+  try {
+    const t = await callCerebro('sessionTopics', {
+      sessionId: id,
+      timeoutMs: TIMEOUT_MS,
+      retries: 0,  // sin retry para topics, no es crítico
+    });
+    topics = extractTopics(t);
+  } catch (err) {
+    // Topics es opcional, no bloquea
+    log.debug(`Topics ${id.slice(-8)} falló: ${err.message}`);
+  }
 
   const derived = deriveFromTurns(turns);
 
@@ -38,7 +65,9 @@ export async function buildProfile(sessionMeta) {
 
   const turnCount = Number(sessionMeta.turnCount) || turns.length || 0;
 
-  const dominantEmotion = derived.dominantEmotion || inferEmotionFromSentiment(avgSentiment);
+  const dominantEmotion = derived.dominantEmotion
+    || inferEmotionFromSentiment(avgSentiment);
+
   const dominantIntent = derived.dominantIntent || 'charla';
 
   const intensity = computeIntensity({
@@ -53,7 +82,7 @@ export async function buildProfile(sessionMeta) {
     avgSentiment,
   });
 
-  const profile = {
+  return {
     id,
     isSimulated: false,
     label: null,
@@ -67,40 +96,63 @@ export async function buildProfile(sessionMeta) {
     topics: topics.slice(0, TOPICS_LIMIT),
     traits,
   };
-
-  return profile;
 }
 
-// ------------------------------------------------------------
-// Fetches
-// ------------------------------------------------------------
+/**
+ * Perfil "ligero": solo con los metadatos de /session/list.
+ * No hace NINGUNA request adicional al Cerebro.
+ * Usado:
+ *   - como fallback cuando el historial falla
+ *   - para sesiones viejas que no han cambiado
+ */
+export function buildProfileFromMeta(sessionMeta) {
+  if (!sessionMeta || !sessionMeta.sessionId) return null;
 
-async function fetchHistory(sessionId) {
-  const res = await callCerebro('sessionHistory', {
-    query: { limit: HISTORY_LIMIT },
-    sessionId,
-    timeoutMs: 5000,
+  const id = String(sessionMeta.sessionId);
+  const turnCount = Number(sessionMeta.turnCount) || 0;
+  const avgSentiment = Number(sessionMeta.avgSentiment) || 0;
+
+  const dominantEmotion = inferEmotionFromSentiment(avgSentiment);
+
+  const intensity = computeIntensity({
+    turnCount,
+    lastActivityAt: sessionMeta.lastActivityAt || Date.now(),
   });
-  const turns = res?.turns;
-  return Array.isArray(turns) ? turns : [];
+
+  return {
+    id,
+    isSimulated: false,
+    label: null,
+    bornAt: Number(sessionMeta.createdAt) || Date.now(),
+    lastSeenAt: Number(sessionMeta.lastActivityAt) || Date.now(),
+    turnCount,
+    sentiment: avgSentiment,
+    intensity,
+    dominantEmotion,
+    dominantIntent: 'charla',
+    topics: [],
+    traits: {
+      openness: 0.5,
+      curiosity: 0.5,
+      emotionality: 0.5,
+      sociality: 0.5,
+      stability: 0.5,
+    },
+  };
 }
 
-async function fetchTopics(sessionId) {
-  const res = await callCerebro('sessionTopics', {
-    sessionId,
-    timeoutMs: 5000,
-  });
-  const topics = res?.topics;
+// ============================================================
+// Derivaciones
+// ============================================================
+
+function extractTopics(t) {
+  const topics = t?.topics;
   if (!Array.isArray(topics)) return [];
   return topics
-    .map(t => (typeof t === 'string' ? t : t?.topic || t?.name))
+    .map(x => (typeof x === 'string' ? x : x?.topic || x?.name))
     .filter(Boolean)
-    .map(t => String(t).slice(0, 40));
+    .map(x => String(x).slice(0, 40));
 }
-
-// ------------------------------------------------------------
-// Derivaciones
-// ------------------------------------------------------------
 
 function deriveFromTurns(turns) {
   const emotionCounts = {};
@@ -142,8 +194,8 @@ function inferEmotionFromSentiment(s) {
 
 function computeIntensity({ turnCount, lastActivityAt }) {
   const hoursSince = (Date.now() - lastActivityAt) / 3600000;
-  const recency = Math.exp(-hoursSince / 6);        // 6h de vida media
-  const activity = Math.min(1, Math.log10(1 + turnCount) / 2); // 100 turnos ≈ 1.0
+  const recency = Math.exp(-hoursSince / 6);
+  const activity = Math.min(1, Math.log10(1 + turnCount) / 2);
   return clamp(0.3 * recency + 0.7 * activity, 0, 1);
 }
 
@@ -161,66 +213,31 @@ function deriveTraits({ intentCounts, emotionCounts, turnCount, avgSentiment }) 
     + (intentCounts.expresion_alegria || 0);
 
   return {
-    openness: clamp(
-      0.4 + philosophy * 0.08 + (turnCount > 10 ? 0.1 : 0),
-      0,
-      1,
-    ),
-    curiosity: clamp(
-      0.4 + curiositySignals * 0.06,
-      0,
-      1,
-    ),
-    emotionality: clamp(
-      0.3 + emotionalSignals * 0.07,
-      0,
-      1,
-    ),
-    sociality: clamp(
-      0.3 + socialSignals * 0.1 + (turnCount > 20 ? 0.15 : 0),
-      0,
-      1,
-    ),
-    stability: clamp(
-      0.5 + avgSentiment * 0.3 - (emotionCounts.ansiedad || 0) * 0.05,
-      0,
-      1,
-    ),
+    openness: clamp(0.4 + philosophy * 0.08 + (turnCount > 10 ? 0.1 : 0), 0, 1),
+    curiosity: clamp(0.4 + curiositySignals * 0.06, 0, 1),
+    emotionality: clamp(0.3 + emotionalSignals * 0.07, 0, 1),
+    sociality: clamp(0.3 + socialSignals * 0.1 + (turnCount > 20 ? 0.15 : 0), 0, 1),
+    stability: clamp(0.5 + avgSentiment * 0.3 - (emotionCounts.ansiedad || 0) * 0.05, 0, 1),
   };
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // Helpers
-// ------------------------------------------------------------
+// ============================================================
 
 const EMOTION_ALIASES = {
-  alegria: 'alegria',
-  alegría: 'alegria',
-  joy: 'alegria',
-  happy: 'alegria',
-  tristeza: 'tristeza',
-  sad: 'tristeza',
-  sadness: 'tristeza',
-  miedo: 'miedo',
-  fear: 'miedo',
-  ira: 'ira',
-  anger: 'ira',
-  angry: 'ira',
-  ansiedad: 'ansiedad',
-  anxiety: 'ansiedad',
-  calma: 'calma',
-  calm: 'calma',
-  curiosidad: 'curiosidad',
-  curiosity: 'curiosidad',
-  sorpresa: 'sorpresa',
-  surprise: 'sorpresa',
+  alegria: 'alegria', 'alegría': 'alegria', joy: 'alegria', happy: 'alegria',
+  tristeza: 'tristeza', sad: 'tristeza', sadness: 'tristeza',
+  miedo: 'miedo', fear: 'miedo',
+  ira: 'ira', anger: 'ira', angry: 'ira',
+  ansiedad: 'ansiedad', anxiety: 'ansiedad',
+  calma: 'calma', calm: 'calma',
+  curiosidad: 'curiosidad', curiosity: 'curiosidad',
+  sorpresa: 'sorpresa', surprise: 'sorpresa',
   nostalgia: 'nostalgia',
-  neutral: 'neutral',
-  neutro: 'neutral',
-  gratitud: 'gratitud',
-  gratitude: 'gratitud',
-  confusion: 'confusion',
-  confusión: 'confusion',
+  neutral: 'neutral', neutro: 'neutral',
+  gratitud: 'gratitud', gratitude: 'gratitud',
+  confusion: 'confusion', 'confusión': 'confusion',
 };
 
 function normalizeEmotion(e) {
@@ -230,8 +247,7 @@ function normalizeEmotion(e) {
 }
 
 function topKey(obj) {
-  let best = null;
-  let bestV = 0;
+  let best = null, bestV = 0;
   for (const [k, v] of Object.entries(obj)) {
     if (v > bestV) { bestV = v; best = k; }
   }
