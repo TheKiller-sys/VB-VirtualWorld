@@ -1,10 +1,8 @@
 // src/world/interactions.js
 // Detección de encuentros y aplicación de efectos sociales.
 //
-// CAMBIOS V1.3.0:
-//   - [FEAT] Diálogo asíncrono via LLM del Cerebro (con fallback a plantillas).
-//   - [FEAT] Registro de encuentro en communityProtocol (opcional).
-//   - [FIX] El tick del mundo no se bloquea esperando al LLM.
+// CAMBIOS V1.6.0:
+//   - [FEAT] El evento 'dialogue' incluye `dialogueId` (persistido en DB).
 
 import { generateDialogue, notifyCommunity } from './dialogue.js';
 import { logger } from '../utils/logger.js';
@@ -106,7 +104,6 @@ export function performInteraction(world, a, b) {
     a.lastDialoguePartnerId = b.id;
     b.lastDialoguePartnerId = a.id;
 
-    // Fire-and-forget: no bloquea el tick
     _generateAndEmitDialogue(world, a, b, {
       similarity: sim,
       gain,
@@ -116,7 +113,6 @@ export function performInteraction(world, a, b) {
       log.debug(`Diálogo falló: ${err.message}`);
     });
 
-    // Notifica al communityProtocol (fire-and-forget)
     notifyCommunity(a, b, {
       similarity: sim,
       gain,
@@ -144,6 +140,7 @@ async function _generateAndEmitDialogue(world, a, b, meta) {
     payload: {
       a: a.id,
       b: b.id,
+      dialogueId: result.dialogueId || null,
       source: result.source,
       x: meta.x,
       y: meta.y,
