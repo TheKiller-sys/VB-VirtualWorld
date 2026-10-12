@@ -1,13 +1,12 @@
 // src/transport/ws.js
-// WebSocket server con broadcast periódico, backpressure, heartbeat
-// y autenticación por token.
+// WebSocket server con broadcast en tiempo real.
 //
-// CAMBIOS V1.1.0:
-//   - [SEC] Rechaza TODAS las conexiones en producción si falta WORLD_WS_TOKEN.
-//   - [SEC] Código de cierre 4001 para token inválido (el cliente lo reconoce).
-//   - [SEC] Log de rechazos con IP.
-//   - [FEAT] Métricas más completas (rejections, bytesOut, messagesSent).
-//   - [FIX] El heartbeat de ping/pong se apoya en ws.ping() nativo.
+// CAMBIOS V1.5.0:
+//   - [PERF] Broadcast LIGERO a wsBroadcastHz (30Hz por defecto).
+//     Solo envía posición y velocidad de cada entidad.
+//   - [FEAT] Broadcast COMPLETO cada wsFullSnapshotIntervalMs (3s).
+//     Incluye emoción, traits, relaciones, etc.
+//   - [FIX] El cliente extrapola entre broadcasts para 0ms de latencia.
 
 import { WebSocketServer } from 'ws';
 import { env } from '../config/env.js';
@@ -15,14 +14,12 @@ import { logger } from '../utils/logger.js';
 
 const log = logger.child('ws');
 
-const MAX_BUFFER_BYTES = 512 * 1024;   // 512KB de backpressure por cliente
+const MAX_BUFFER_BYTES = 512 * 1024;
 const HEARTBEAT_INTERVAL_MS = 25000;
 const CLOSE_TOKEN_INVALID = 4001;
 const CLOSE_TOO_MANY = 1013;
 
 export function createWSServer(httpServer, world) {
-  // ---------- Guard de configuración ----------
-  // En producción, si no hay token, NO aceptamos conexiones.
   const requireToken = env.isProd && !env.worldWsToken;
 
   if (requireToken) {
@@ -48,6 +45,8 @@ export function createWSServer(httpServer, world) {
     rejectedLimit: 0,
     bytesOut: 0,
     messagesSent: 0,
+    lightBroadcasts: 0,
+    fullBroadcasts: 0,
     lastConnectionAt: 0,
     lastDisconnectAt: 0,
   };
@@ -55,7 +54,7 @@ export function createWSServer(httpServer, world) {
   wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress || 'unknown';
 
-    // ---------- Guard: configuración inválida ----------
+    // Guard: configuración inválida
     if (requireToken) {
       stats.rejected++;
       stats.rejectedAuth++;
@@ -64,7 +63,7 @@ export function createWSServer(httpServer, world) {
       return;
     }
 
-    // ---------- Autenticación por token ----------
+    // Autenticación por token
     if (env.worldWsToken) {
       let token = null;
       try {
@@ -82,7 +81,7 @@ export function createWSServer(httpServer, world) {
       }
     }
 
-    // ---------- Límite de clientes ----------
+    // Límite de clientes
     if (clients.size >= env.wsMaxClients) {
       stats.rejected++;
       stats.rejectedLimit++;
@@ -91,7 +90,6 @@ export function createWSServer(httpServer, world) {
       return;
     }
 
-    // ---------- Cliente aceptado ----------
     stats.totalConnections++;
     stats.lastConnectionAt = Date.now();
 
@@ -108,14 +106,14 @@ export function createWSServer(httpServer, world) {
 
     log.info(`🔌 WS cliente ${client.id} conectado (total=${clients.size})`);
 
-    // Snapshot inicial
+    // Snapshot COMPLETO inicial
     safeSend(client, {
       type: 'welcome',
       serverTime: Date.now(),
       snapshot: world.snapshot(),
     });
 
-    // ---------- Mensajes del cliente ----------
+    // Mensajes del cliente
     ws.on('message', (raw) => {
       client.lastSeenAt = Date.now();
 
@@ -144,7 +142,6 @@ export function createWSServer(httpServer, world) {
       }
     });
 
-    // ---------- Pong nativo ----------
     ws.on('pong', () => {
       client.isAlive = true;
       client.lastSeenAt = Date.now();
@@ -177,22 +174,42 @@ export function createWSServer(httpServer, world) {
   }, HEARTBEAT_INTERVAL_MS);
   if (heartbeat.unref) heartbeat.unref();
 
-  // ---------- Broadcast periódico ----------
+  // ---------- Broadcast ----------
+  let lastFullBroadcastAt = 0;
+  const broadcastIntervalMs = Math.max(16, Math.round(1000 / env.wsBroadcastHz));
+  const fullIntervalMs = env.wsFullSnapshotIntervalMs;
+
   const broadcastInterval = setInterval(() => {
     if (clients.size === 0) {
-      world.drainEvents();  // drena para no acumular memoria
+      // Drena eventos incluso sin clientes para no acumular memoria
+      world.drainEvents();
       return;
     }
 
-    const snapshot = world.snapshot();
+    const now = Date.now();
+    const isFull = (now - lastFullBroadcastAt) >= fullIntervalMs;
+
+    let payload;
     const events = world.drainEvents();
 
-    const payload = JSON.stringify({
-      type: 'tick',
-      snapshot,
-      events,
-      serverTime: Date.now(),
-    });
+    if (isFull) {
+      lastFullBroadcastAt = now;
+      stats.fullBroadcasts++;
+      payload = JSON.stringify({
+        type: 'full',
+        snapshot: world.snapshot(),
+        events,
+        serverTime: now,
+      });
+    } else {
+      stats.lightBroadcasts++;
+      payload = JSON.stringify({
+        type: 'tick',
+        snapshot: world.snapshotLight(),
+        events,
+        serverTime: now,
+      });
+    }
 
     const payloadBytes = Buffer.byteLength(payload);
 
@@ -202,7 +219,7 @@ export function createWSServer(httpServer, world) {
         continue;
       }
       if (client.ws.bufferedAmount > MAX_BUFFER_BYTES) {
-        continue;  // backpressure
+        continue;
       }
       try {
         client.ws.send(payload);
@@ -214,7 +231,7 @@ export function createWSServer(httpServer, world) {
         try { client.ws.close(); } catch (_) {}
       }
     }
-  }, Math.max(30, Math.round(1000 / env.wsBroadcastHz)));
+  }, broadcastIntervalMs);
   if (broadcastInterval.unref) broadcastInterval.unref();
 
   // ---------- API ----------
@@ -255,6 +272,7 @@ export function createWSServer(httpServer, world) {
       clients: clients.size,
       maxClients: env.wsMaxClients,
       broadcastHz: env.wsBroadcastHz,
+      fullSnapshotIntervalMs: env.wsFullSnapshotIntervalMs,
       requiresToken: !!env.worldWsToken,
       requireTokenMissing: requireToken,
       ...stats,
