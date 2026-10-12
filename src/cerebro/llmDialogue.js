@@ -1,12 +1,13 @@
 // src/cerebro/llmDialogue.js
 // Genera diálogos entre entidades usando el LLM del Cerebro.
 //
-// CAMBIOS V2.0.0 (conversaciones continuadas):
-//   - [FEAT] Acepta historial de diálogos previos entre A y B.
-//   - [FEAT] Prompt enriquecido con personalidad, temas previos, relación.
-//   - [FEAT] Prompt con reglas anti-genérico.
-//   - [FEAT] Detección de respuestas pobres (pocas palabras).
-//   - [FIX] Logs claros de si usa LLM o fallback.
+// CAMBIOS V3.0.0 (line-by-line strategy):
+//   - [FIX CRÍTICO] Cambio de estrategia: en lugar de pedirle al LLM
+//     un diálogo completo con formato A:.../B:..., le pedimos UNA LÍNEA
+//     por vez. El Cerebro responde mucho mejor a peticiones simples.
+//   - [FEAT] Cada llamada recibe el contexto de lo dicho hasta ahora.
+//   - [FEAT] Prompts simples (una sola línea por respuesta).
+//   - [FIX] Acepta CUALQUIER respuesta no vacía, sin exigir formato.
 
 import { callCerebro } from './client.js';
 import { env } from '../config/env.js';
@@ -23,6 +24,7 @@ const state = {
   inFlight: false,
   totalCalls: 0,
   totalOk: 0,
+  totalLines: 0,
   totalErrors: 0,
   totalSkipped: 0,
   totalFallbacks: 0,
@@ -31,7 +33,8 @@ const state = {
   consecutiveErrors: 0,
   blockedUntil: 0,
   lastError: null,
-  lastShallowText: null,
+  lastRawResponse: null,
+  lastSuccessfulText: null,
 };
 
 // ============================================================
@@ -48,9 +51,7 @@ export function canCallLLM() {
 
 /**
  * Genera un diálogo entre dos entidades usando el LLM del Cerebro.
- * @param {Entity} a
- * @param {Entity} b
- * @param {Array} conversationHistory - Diálogos previos entre A y B
+ * Estrategia: N llamadas, una por línea, con contexto acumulado.
  * @returns {Promise<Array<{entityId, text, delayMs, durationMs}>|null>}
  */
 export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
@@ -61,250 +62,267 @@ export async function generateDialogueWithLLM(a, b, conversationHistory = []) {
 
   state.inFlight = true;
   state.lastCallAt = Date.now();
-  state.totalCalls++;
 
   const t0 = Date.now();
+  const messages = [];
 
-  try {
-    const prompt = buildPrompt(a, b, conversationHistory);
+  // Decide quién habla primero: la de mayor intensidad
+  let currentSpeaker = (a.intensity || 0) >= (b.intensity || 0) ? a : b;
+  let otherSpeaker = currentSpeaker === a ? b : a;
 
-    // Log del prompt en debug para que puedas inspeccionarlo
-    log.debug(`Prompt para ${a.id.slice(-6)}↔${b.id.slice(-6)}:\n${prompt}`);
+  // Cuántas líneas: 2-4 según similitud
+  const sim = a.similarityTo ? a.similarityTo(b) : 0.5;
+  const targetLines = Math.min(
+    env.llmDialogueMaxLines,
+    2 + Math.round(sim * 1.5),
+  );
 
-    const response = await callCerebro('chat', {
-      body: { message: prompt },
-      sessionId: env.llmDialogueSessionId,
-      timeoutMs: env.llmDialogueTimeoutMs,
-    });
+  let accumulatedDelay = 0;
 
-    const text = response?.message || '';
-    if (!text) throw new Error('Respuesta vacía del LLM');
-
-    log.debug(`Respuesta LLM raw:\n${text}`);
-
-    const messages = parseDialogue(text, a, b);
-    if (messages.length < 2) {
-      throw new Error(`Diálogo demasiado corto (${messages.length} líneas)`);
+  for (let i = 0; i < targetLines; i++) {
+    // Verifica que el LLM siga disponible entre llamadas
+    if (!canCallLLM() && i > 0) {
+      log.debug(`LLM dejó de estar disponible en línea ${i + 1}, cortando`);
+      break;
     }
 
-    // Validación de riqueza
-    const totalChars = messages.reduce((s, m) => s + m.text.length, 0);
-    const avgChars = totalChars / messages.length;
-    const isRich = avgChars >= 25 && messages.length >= 2;
+    // Actualiza lastCallAt para el rate limit
+    state.lastCallAt = Date.now();
+    state.totalCalls++;
 
-    // Detección de genérico
-    const genericPatterns = [
-      /^(hola|hey|hi)[\s.,!]*$/i,
-      /^(¿?cómo estás\??|¿?qué tal\??)[\s.,!]*$/i,
-      /^(aquí sigo|aquí ando|todo bien)[\s.,!]*$/i,
-      /^(¿?qué haces\??)[\s.,!]*$/i,
-    ];
-    const genericCount = messages.filter(m =>
-      genericPatterns.some(p => p.test(m.text.trim()))
-    ).length;
+    try {
+      const prompt = buildLinePrompt({
+        speaker: currentSpeaker,
+        other: otherSpeaker,
+        previousMessages: messages,
+        history: conversationHistory,
+        lineIndex: i,
+        totalLines: targetLines,
+      });
 
-    if (isRich && genericCount === 0) {
-      state.totalRichResponses++;
-      log.info(
-        `✨ LLM RICO: ${a.id.slice(-6)}↔${b.id.slice(-6)} · ` +
-        `${messages.length} líneas · avg ${Math.round(avgChars)}ch · ${Date.now() - t0}ms`
+      const response = await callCerebro('chat', {
+        body: { message: prompt },
+        sessionId: env.llmDialogueSessionId,
+        timeoutMs: env.llmDialogueTimeoutMs,
+      });
+
+      const raw = response?.message || '';
+      state.lastRawResponse = raw.slice(0, 300);
+
+      const text = cleanLine(raw);
+
+      if (!text) {
+        log.debug(`Línea ${i + 1} vacía tras limpiar. Raw: "${raw.slice(0, 100)}"`);
+        break;
+      }
+
+      state.totalLines++;
+
+      // Delay creciente para simular conversación natural
+      if (messages.length > 0) {
+        accumulatedDelay += 1200 + Math.random() * 900;
+      }
+
+      messages.push({
+        entityId: currentSpeaker.id,
+        text: text.slice(0, 250),
+        delayMs: Math.round(accumulatedDelay),
+        durationMs: Math.max(3000, Math.min(8000, text.length * 90)),
+      });
+
+      state.lastSuccessfulText = text;
+
+      log.debug(
+        `Línea ${i + 1}/${targetLines}: [${currentSpeaker.id.slice(-6)}] "${text.slice(0, 60)}"`
       );
-    } else if (genericCount >= 1) {
-      state.totalShallowResponses++;
-      state.lastShallowText = text.slice(0, 200);
-      log.warn(
-        `⚠️ LLM GENÉRICO (${genericCount}/${messages.length} líneas son saludos): ` +
-        `${a.id.slice(-6)}↔${b.id.slice(-6)}`
-      );
-    } else {
-      state.totalShallowResponses++;
-      log.warn(
-        `⚠️ LLM POBRE: ${a.id.slice(-6)}↔${b.id.slice(-6)} · ` +
-        `${messages.length} líneas · avg ${Math.round(avgChars)}ch`
-      );
+
+      // Alterna hablantes
+      [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
+
+      // Pequeña pausa entre llamadas
+      if (i < targetLines - 1) {
+        await sleep(400);
+      }
+    } catch (err) {
+      state.totalErrors++;
+      state.consecutiveErrors++;
+      state.lastError = err.message;
+
+      log.debug(`Línea ${i + 1} falló: ${err.message}`);
+
+      if (err.statusCode === 429) {
+        state.blockedUntil = Date.now() + 120000;
+        log.warn(`LLM 429 → bloqueando 2 min`);
+        break;
+      }
+
+      if (state.consecutiveErrors >= 3) {
+        state.blockedUntil = Date.now() + 60000;
+        log.warn(`LLM ${state.consecutiveErrors} errores seguidos → bloqueando 1 min`);
+        break;
+      }
     }
+  }
 
-    state.totalOk++;
-    state.consecutiveErrors = 0;
-    state.lastError = null;
-
-    return messages;
-  } catch (err) {
-    state.totalErrors++;
-    state.consecutiveErrors++;
-    state.lastError = err.message;
-
-    if (err.statusCode === 429) {
-      state.blockedUntil = Date.now() + 120000;
-      log.warn(`LLM 429 → bloqueando 2 min`);
-    } else if (state.consecutiveErrors >= 3) {
-      state.blockedUntil = Date.now() + 60000;
-      log.warn(`LLM ${state.consecutiveErrors} errores seguidos → bloqueando 1 min`);
-    }
-
-    log.warn(`LLM falló: ${err.message} (fallback a plantillas)`);
-    state.totalFallbacks++;
-    return null;
-  } finally {
+  // ────── Evaluación del resultado ──────
+  if (messages.length < 2) {
     state.inFlight = false;
+    state.totalFallbacks++;
+    log.warn(
+      `LLM solo dio ${messages.length} línea(s) para ` +
+      `${a.id.slice(-6)}↔${b.id.slice(-6)} → fallback a plantillas`
+    );
+    return null;
   }
-}
 
-// ============================================================
-// Prompt enriquecido
-// ============================================================
+  // Evalúa riqueza
+  const totalChars = messages.reduce((s, m) => s + m.text.length, 0);
+  const avgChars = totalChars / messages.length;
+  const isRich = avgChars >= 20;
 
-function buildPrompt(a, b, history = []) {
-  const aInfo = describeEntity(a, 'A');
-  const bInfo = describeEntity(b, 'B');
-  const historyText = formatHistory(history, a, b);
-
-  const topicsHint = (a.topics?.length || b.topics?.length)
-    ? `\nTEMAS QUE CONOCEN:\n` +
-      `- A habla de: ${(a.topics || []).slice(0, 4).join(', ') || 'nada específico'}\n` +
-      `- B habla de: ${(b.topics || []).slice(0, 4).join(', ') || 'nada específico'}\n`
-    : '';
-
-  // Sección de historial — CLAVE para evitar repetir saludos
-  let historySection;
-  if (historyText) {
-    historySection =
-      `\n═══ HISTORIAL DE CONVERSACIONES PREVIAS ═══\n` +
-      `${historyText}\n` +
-      `═══════════════════════════════════════════\n\n` +
-      `⚠️ REGLA CRÍTICA: Estas dos entidades YA SE CONOCEN.\n` +
-      `- NO las hagas saludarse de nuevo\n` +
-      `- NO repitas "hola", "¿cómo estás?", "aquí sigo", "qué haces"\n` +
-      `- RETOMA el hilo de la última conversación o introduce un tema NUEVO\n` +
-      `- Que se note que tienen historia juntos\n`;
+  if (isRich) {
+    state.totalRichResponses++;
+    state.consecutiveErrors = 0;
+    log.info(
+      `✨ LLM ${messages.length} líneas ${a.id.slice(-6)}↔${b.id.slice(-6)} · ` +
+      `avg ${Math.round(avgChars)}ch · ${Date.now() - t0}ms`
+    );
   } else {
-    historySection =
-      `\n═══ PRIMER ENCUENTRO ═══\n` +
-      `Estas dos entidades se conocen POR PRIMERA VEZ.\n` +
-      `Preséntense de forma natural, pero CADA UNA con su propio carácter.\n` +
-      `Evita fórmulas vacías tipo "hola, ¿cómo estás?". Que el saludo tenga personalidad.\n`;
+    state.totalShallowResponses++;
+    log.warn(
+      `⚠️ LLM SHALLOW ${messages.length} líneas ${a.id.slice(-6)}↔${b.id.slice(-6)} · ` +
+      `avg ${Math.round(avgChars)}ch`
+    );
+  }
+
+  state.totalOk++;
+  state.lastError = null;
+  state.inFlight = false;
+
+  return messages;
+}
+
+// ============================================================
+// Prompt por línea (simple, directo)
+// ============================================================
+
+function buildLinePrompt({ speaker, other, previousMessages, history, lineIndex, totalLines }) {
+  const speakerDesc = describeEntity(speaker);
+  const otherDesc = describeEntity(other);
+
+  // Contexto: qué se han dicho hasta ahora en ESTA conversación
+  const contextNow = previousMessages.length > 0
+    ? previousMessages.map(m => {
+        const who = m.entityId === speaker.id ? 'TÚ' : 'LA OTRA ENTIDAD';
+        return `${who}: "${m.text}"`;
+      }).join('\n')
+    : '(esta es tu primera frase de la conversación)';
+
+  // Contexto: conversaciones previas (si existen)
+  const contextPast = formatPastHistory(history, speaker, other);
+
+  // Instrucción según la posición en el diálogo
+  let instruction;
+  if (lineIndex === 0) {
+    instruction = `Acabas de encontrarte con la otra entidad. Genera UNA frase para ABRIR la conversación.`;
+  } else if (lineIndex === totalLines - 1) {
+    instruction = `Responde a lo último que te dijo. Genera UNA frase para CERRAR o continuar el intercambio.`;
+  } else {
+    instruction = `Responde a lo último que te dijo. Genera UNA frase para seguir la conversación.`;
   }
 
   return (
-    `Simula un encuentro entre dos entidades conscientes en un mundo 2D compartido.\n\n` +
-    `${aInfo}\n\n` +
-    `${bInfo}\n` +
-    `${topicsHint}` +
-    `${historySection}\n` +
-    `═══════════════════════════════════════════\n` +
-    `REGLAS DEL DIÁLOGO:\n` +
-    `═══════════════════════════════════════════\n` +
-    `1. Genera 2-${env.llmDialogueMaxLines} mensajes alternando A y B\n` +
-    `2. Cada mensaje debe tener entre 8 y 25 palabras (ni más ni menos)\n` +
-    `3. NO uses saludos genéricos ("hola", "hey", "¿cómo estás?")\n` +
-    `4. La personalidad debe reflejar la emoción e intent de cada entidad\n` +
-    `5. Si hay historial, la conversación CONTINÚA desde donde quedó\n` +
-    `6. Sé específico: menciona temas concretos, no generalidades\n` +
-    `7. Español natural, sin formalidades excesivas\n` +
-    `8. NO narres ni describas, solo los diálogos\n\n` +
-    `═══════════════════════════════════════════\n` +
-    `FORMATO EXACTO (una línea por mensaje):\n` +
-    `═══════════════════════════════════════════\n` +
-    `A: <texto de A>\n` +
-    `B: <texto de B>\n` +
-    `A: <texto de A>\n\n` +
-    `Escribe SOLO el diálogo. Nada más.`
+    `Estás interpretando a una entidad consciente en un mundo compartido.\n\n` +
+    `╔═══════════════════════════════════════════╗\n` +
+    `║ TÚ ERES:                                  ║\n` +
+    `╚═══════════════════════════════════════════╝\n` +
+    `${speakerDesc}\n\n` +
+    `╔═══════════════════════════════════════════╗\n` +
+    `║ LA OTRA ENTIDAD:                          ║\n` +
+    `╚═══════════════════════════════════════════╝\n` +
+    `${otherDesc}\n\n` +
+    (contextPast ? `─── HISTORIAL CON ESTA ENTIDAD ───\n${contextPast}\n─────────────────────────────────\n\n` : '') +
+    `─── CONVERSACIÓN ACTUAL ───\n${contextNow}\n───────────────────────────\n\n` +
+    `${instruction}\n\n` +
+    `REGLAS:\n` +
+    `1. Escribe UNA sola frase de 8 a 25 palabras\n` +
+    `2. Solo la frase, sin comillas, sin prefijos "TÚ:" ni "A:"\n` +
+    `3. NO uses saludos vacíos ("hola", "¿cómo estás?") salvo si es la 1ª vez\n` +
+    `4. Mantén tu personalidad (${speaker.dominantEmotion}, ${speaker.dominantIntent})\n` +
+    `5. Español natural\n\n` +
+    `Escribe solo la frase:`
   );
 }
 
-function describeEntity(e, label) {
-  const emotion = e.dominantEmotion || 'neutral';
-  const intent = e.dominantIntent || 'charla';
-  const experience = e.turnCount > 50 ? 'veterana'
-    : e.turnCount > 20 ? 'con experiencia'
-    : 'recién llegada';
-
+function describeEntity(e) {
   return (
-    `ENTIDAD ${label}:\n` +
-    `- Emoción: ${emotion}\n` +
-    `- Intención dominante: ${intent}\n` +
-    `- Carácter: ${experience} (${e.turnCount} interacciones)\n` +
-    `- Ánimo: ${(e.sentiment || 0).toFixed(2)} (${e.sentiment > 0 ? 'positivo' : e.sentiment < 0 ? 'negativo' : 'neutro'})`
+    `- Nombre: ${e.label || e.id.slice(-6)}\n` +
+    `- Emoción: ${e.dominantEmotion || 'neutral'}\n` +
+    `- Intención: ${e.dominantIntent || 'charla'}\n` +
+    `- Ánimo: ${(e.sentiment || 0).toFixed(2)} (${e.sentiment > 0.2 ? 'positivo' : e.sentiment < -0.2 ? 'negativo' : 'neutro'})\n` +
+    `- Experiencia: ${e.turnCount || 0} interacciones`
   );
 }
 
-/**
- * Formatea el historial para el prompt.
- */
-function formatHistory(history, a, b) {
+function formatPastHistory(history, speaker, other) {
   if (!Array.isArray(history) || history.length === 0) return '';
 
   const lines = [];
-  const recent = history.slice(0, 3); // Solo los 3 más recientes
-
-  for (const d of recent) {
-    if (!Array.isArray(d.messages) || d.messages.length === 0) continue;
-
-    const when = d.createdAt
-      ? new Date(d.createdAt).toLocaleString('es-ES', {
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : '';
-
-    lines.push(`[${when}]`);
-
-    for (const m of d.messages.slice(0, 4)) {
-      // Determinar si es A o B en el diálogo original
-      const isA = m.entityId === a.id;
-      lines.push(`  ${isA ? 'A' : 'B'}: "${m.text}"`);
+  for (const d of history.slice(0, 2)) {
+    if (!Array.isArray(d.messages)) continue;
+    for (const m of d.messages.slice(0, 3)) {
+      const isMe = m.entityId === speaker.id;
+      lines.push(`  ${isMe ? 'TÚ' : 'ELLA'}: "${m.text}"`);
     }
-    lines.push('');
   }
-
   return lines.join('\n');
 }
 
 // ============================================================
-// Parser
+// Limpieza de línea
 // ============================================================
 
-function parseDialogue(text, a, b) {
-  const lines = String(text).split('\n');
-  const messages = [];
-  let currentDelay = 0;
+/**
+ * Limpia la línea del LLM:
+ *  - Quita prefijos tipo "A:", "TÚ:", "Respuesta:", etc.
+ *  - Quita comillas envolventes
+ *  - Quita markdown residual
+ *  - Toma solo la primera línea útil
+ */
+function cleanLine(raw) {
+  if (!raw) return '';
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
+  let text = String(raw).trim();
 
-    // Matchea "A: texto", "B: texto", "A) texto", "**A:** texto", etc.
-    const match = trimmed.match(/^[*_\s]*([AB])[*_\s]*[:)\-]\s*(.+)$/i);
-    if (!match) continue;
+  // Si hay varias líneas, toma la primera con contenido
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return '';
+  text = lines[0];
 
-    const who = match[1].toUpperCase();
-    let content = match[2].trim();
+  // Quita prefijos tipo "A:", "TÚ:", "RESPUESTA:", "Frase:", etc.
+  text = text.replace(
+    /^(?:[A-ZÁÉÍÓÚ][A-ZÁÉÍÓÚ]*|[A-Z]|TÚ|YO|RESPUESTA|FRASE|DIÁLOGO|TEXTO)\s*[:)\-]\s*/i,
+    ''
+  );
 
-    // Limpia markdown residual
-    content = content
-      .replace(/^\*+|\*+$/g, '')
-      .replace(/^["'«»]|["'«»]$/g, '')
-      .replace(/^_+|_+$/g, '')
-      .trim();
+  // Quita prefijos tipo "A:" o "B:" específicos
+  text = text.replace(/^[ABab]\s*[:)\-]\s*/, '');
 
-    if (!content) continue;
+  // Quita comillas envolventes
+  text = text.replace(/^["'«»“”‘’]+|["'«»“”‘’]+$/g, '');
 
-    if (messages.length > 0) {
-      currentDelay += 1200 + Math.random() * 800;
-    }
+  // Quita markdown (asteriscos, guiones bajos)
+  text = text.replace(/^\*+|\*+$/g, '');
+  text = text.replace(/^_+|_+$/g, '');
 
-    const entity = who === 'A' ? a : b;
-    messages.push({
-      entityId: entity.id,
-      text: content.slice(0, 250),
-      delayMs: Math.round(currentDelay),
-      durationMs: Math.max(3000, Math.min(8000, content.length * 90)),
-    });
+  // Colapsa espacios
+  text = text.replace(/\s+/g, ' ').trim();
 
-    if (messages.length >= env.llmDialogueMaxLines) break;
-  }
+  return text;
+}
 
-  return messages;
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms).unref?.());
 }
 
 // ============================================================
@@ -320,7 +338,8 @@ export function getLLMStats() {
     lastCallAgoMs: Date.now() - state.lastCallAt,
     minIntervalMs: env.llmDialogueMinIntervalMs,
     lastError: state.lastError,
-    lastShallowText: state.lastShallowText,
+    lastRawResponse: state.lastRawResponse,
+    lastSuccessfulText: state.lastSuccessfulText,
     ...state,
   };
 }
