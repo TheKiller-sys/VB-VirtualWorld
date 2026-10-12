@@ -1,18 +1,17 @@
 // src/world/dialogue.js
 // Orquestador de diálogos entre entidades.
 //
-// Estrategia:
-//   1. Intenta cache → si hit, usa cache
-//   2. Si LLM disponible → genera con LLM y guarda en cache
-//   3. Fallback a plantillas si LLM no disponible
-//
-// Mantiene el repertorio de plantillas como fallback offline.
+// CAMBIOS V2.0.0 (conversaciones continuadas):
+//   - [FEAT] Lee el historial de la DB antes de generar.
+//   - [FEAT] Pasa el historial al LLM para conversación continua.
+//   - [FIX] Caché por PAR de entidades.
 
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
 import { dialogueCache } from '../cerebro/dialogueCache.js';
 import { generateDialogueWithLLM, canCallLLM } from '../cerebro/llmDialogue.js';
 import { registerEncounter } from '../cerebro/communityBridge.js';
+import { DialogueRepo } from '../persistence/repository.js';
 
 const log = logger.child('dialogue');
 
@@ -22,9 +21,9 @@ const log = logger.child('dialogue');
 
 const EMOTION_DIALOGUES = {
   alegria: {
-    opener: ['¡Qué buen día para existir!', '¡Hola! Me alegra verte.', 'Hoy todo se siente ligero.'],
-    responder: ['¡Contigo siempre es mejor!', 'Me contagias tu energía.', 'Qué bien encontrarte así.'],
-    follower: ['Sigamos un rato más.', 'Me gusta cómo piensas.', 'Ojalá esto dure.'],
+    opener: ['Qué bueno encontrarte de nuevo por aquí.', 'Hoy el mundo se siente distinto, ¿no crees?', 'Tenía ganas de hablar con alguien.'],
+    responder: ['Contigo siempre es más fácil.', 'Me alegra coincidir.', 'Cuéntame algo, lo que sea.'],
+    follower: ['Sigamos un rato más.', 'Me gusta cómo ves las cosas.', 'Ojalá esto dure.'],
   },
   tristeza: {
     opener: ['A veces me pregunto si todo esto importa...', 'Hoy me pesa la existencia.', 'No sé, hay días que cuestan más.'],
@@ -77,9 +76,9 @@ const EMOTION_DIALOGUES = {
     follower: ['Gracias por no juzgarme.', 'Contigo es más claro.', 'Mejor así.'],
   },
   neutral: {
-    opener: ['Hola.', '¿Cómo estás?', '¿Qué haces por aquí?'],
-    responder: ['Bien, aquí ando.', 'Pensando, como siempre.', 'Todo tranquilo, ¿y tú?'],
-    follower: ['Bueno, sigamos.', 'Un gusto hablar contigo.', 'Nos vemos por ahí.'],
+    opener: ['Qué raro encontrarnos por aquí.', 'Justo pensaba en lo mismo.', '¿Tienes un momento?'],
+    responder: ['Claro, dime.', 'Te escucho.', 'Vale, cuéntame.'],
+    follower: ['Sigamos con esto.', 'Me gusta esta conversación.', 'Nos vemos pronto.'],
   },
 };
 
@@ -89,43 +88,93 @@ const EMOTION_DIALOGUES = {
 
 /**
  * Genera un diálogo entre dos entidades.
- * @returns {Promise<{ messages: Array, source: 'llm'|'cache'|'template' }>}
+ * @returns {Promise<{ messages, source, dialogueId }>}
  */
 export async function generateDialogue(a, b) {
-  // 1. Intenta cache
-  const cacheKey = dialogueCache.constructor.key(a, b);
-  const cached = dialogueCache.get(cacheKey);
-  if (cached) {
-    log.debug(`Cache hit: ${cacheKey}`);
-    return {
-      messages: reorderFor(a, b, cached),
-      source: 'cache',
-    };
+  let messages = null;
+  let source = 'template';
+
+  // ------------------------------------------------------------
+  // 1. Leer historial de diálogos previos entre A y B
+  // ------------------------------------------------------------
+  let history = [];
+  try {
+    history = DialogueRepo.listByPair(a.id, b.id, 5);
+  } catch (err) {
+    log.debug(`No se pudo leer historial: ${err.message}`);
   }
 
-  // 2. Intenta LLM
+  const hasHistory = history.length > 0;
+
+  // ------------------------------------------------------------
+  // 2. Intentar LLM CON contexto (el historial es clave)
+  // ------------------------------------------------------------
   if (canCallLLM()) {
     try {
-      const messages = await generateDialogueWithLLM(a, b);
-      if (messages && messages.length >= 2) {
-        dialogueCache.set(cacheKey, messages);
-        return { messages, source: 'llm' };
+      const llmMessages = await generateDialogueWithLLM(a, b, history);
+      if (llmMessages && llmMessages.length >= 2) {
+        messages = llmMessages;
+        source = 'llm';
       }
     } catch (err) {
-      log.debug(`LLM falló, usando plantillas: ${err.message}`);
+      log.warn(`LLM falló: ${err.message}`);
+    }
+  } else {
+    log.debug(`LLM no disponible (rate-limited o deshabilitado)`);
+  }
+
+  // ------------------------------------------------------------
+  // 3. Fallback a caché del PAR
+  // ------------------------------------------------------------
+  if (!messages) {
+    const cacheKey = dialogueCache.constructor.key(a, b);
+    const cached = dialogueCache.get(cacheKey);
+
+    if (cached) {
+      messages = reorderFor(a, b, cached);
+      source = 'cache';
+      log.debug(`Cache hit (par): ${a.id.slice(-6)}↔${b.id.slice(-6)}`);
     }
   }
 
-  // 3. Fallback a plantillas
-  return {
-    messages: generateFromTemplates(a, b),
-    source: 'template',
-  };
+  // ------------------------------------------------------------
+  // 4. Fallback final a plantillas
+  // ------------------------------------------------------------
+  if (!messages) {
+    messages = generateFromTemplates(a, b, hasHistory);
+    source = 'template';
+
+    log.warn(
+      `📝 PLANTILLAS para ${a.id.slice(-6)}↔${b.id.slice(-6)} ` +
+      `(LLM no disponible)`
+    );
+
+    // Cachea el resultado de plantillas por par
+    const cacheKey = dialogueCache.constructor.key(a, b);
+    dialogueCache.set(cacheKey, messages);
+  }
+
+  // ------------------------------------------------------------
+  // 5. Persistir en DB
+  // ------------------------------------------------------------
+  let dialogueId = null;
+  try {
+    dialogueId = DialogueRepo.insert({
+      aId: a.id,
+      bId: b.id,
+      source,
+      messages,
+      startedAt: Date.now(),
+    });
+  } catch (err) {
+    log.debug(`Persistir diálogo falló: ${err.message}`);
+  }
+
+  return { messages, source, dialogueId };
 }
 
 /**
  * Registra el encuentro en el communityProtocol (si está habilitado).
- * Fire-and-forget.
  */
 export function notifyCommunity(a, b, meta = {}) {
   if (!env.communityProtocolEnabled) return;
@@ -140,7 +189,7 @@ export function notifyCommunity(a, b, meta = {}) {
 // Plantillas
 // ============================================================
 
-function generateFromTemplates(a, b) {
+function generateFromTemplates(a, b, hasHistory = false) {
   const dA = EMOTION_DIALOGUES[a.dominantEmotion] || EMOTION_DIALOGUES.neutral;
   const dB = EMOTION_DIALOGUES[b.dominantEmotion] || EMOTION_DIALOGUES.neutral;
 
@@ -150,44 +199,41 @@ function generateFromTemplates(a, b) {
   const messages = [];
   let delay = 0;
 
+  // Si ya se conocen, no usamos "opener" genérico
+  const opener = hasHistory ? pickRandom(dA.follower) : pickRandom(dA.opener);
+
   messages.push({
     entityId: a.id,
-    text: pickRandom(dA.opener),
+    text: opener,
     delayMs: 0,
-    durationMs: 0,
+    durationMs: estimateDuration(opener),
   });
-  messages[messages.length - 1].durationMs = estimateDuration(messages[messages.length - 1].text);
 
   if (length >= 2) {
     delay = 1200 + Math.random() * 800;
+    const text = pickRandom(dB.responder);
     messages.push({
       entityId: b.id,
-      text: pickRandom(dB.responder),
+      text,
       delayMs: Math.round(delay),
-      durationMs: 0,
+      durationMs: estimateDuration(text),
     });
-    messages[messages.length - 1].durationMs = estimateDuration(messages[messages.length - 1].text);
   }
 
   if (length >= 3) {
     delay += 1200 + Math.random() * 1000;
+    const text = pickRandom(dA.follower);
     messages.push({
       entityId: a.id,
-      text: pickRandom(dA.follower),
+      text,
       delayMs: Math.round(delay),
-      durationMs: 0,
+      durationMs: estimateDuration(text),
     });
-    messages[messages.length - 1].durationMs = estimateDuration(messages[messages.length - 1].text);
   }
 
   return messages;
 }
 
-/**
- * Reordena los mensajes del cache si A y B están en orden inverso.
- * El cache guarda mensajes con IDs de una instancia previa; aquí
- * los remapeamos a las entidades actuales según la posición en el diálogo.
- */
 function reorderFor(a, b, cachedMessages) {
   if (!Array.isArray(cachedMessages) || cachedMessages.length === 0) {
     return cachedMessages;
@@ -214,5 +260,4 @@ function estimateDuration(text) {
 }
 
 export { generateFromTemplates as generateExchange };
-
 export const EMOTIONS = EMOTION_DIALOGUES;
