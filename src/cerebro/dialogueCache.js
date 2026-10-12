@@ -1,6 +1,14 @@
 // src/cerebro/dialogueCache.js
 // Cache LRU + TTL para diálogos generados por el LLM del Cerebro.
-// Evita repetir llamadas costosas para combinaciones similares.
+//
+// CAMBIOS V2.0.0:
+//   - [FIX] La clave ahora es por PAR de entidades (a.id + b.id).
+//     Antes era por emoción+intent, lo que hacía que todas las
+//     entidades "neutral/charla" compartieran el mismo diálogo.
+//   - [FIX] TTL reducido a 15min por defecto. Antes 2h hacía que
+//     los mismos diálogos se sirvieran durante horas.
+//   - [FEAT] Solo se usa como optimización del fallback (cuando el
+//     LLM no está disponible o está rate-limited).
 
 import { env } from '../config/env.js';
 
@@ -8,7 +16,7 @@ class DialogueCache {
   constructor({ maxSize, ttlMs }) {
     this.maxSize = maxSize;
     this.ttlMs = ttlMs;
-    this.map = new Map();  // key → { value, expiresAt }
+    this.map = new Map();
     this.stats = {
       hits: 0,
       misses: 0,
@@ -18,17 +26,29 @@ class DialogueCache {
   }
 
   /**
-   * Construye la clave a partir de dos entidades.
-   * Ordena alfabéticamente para que A-B y B-A compartan cache.
+   * Construye una clave por PAR de entidades.
+   * Dos entidades A y B siempre tienen la misma clave,
+   * sin importar el orden.
    */
   static key(a, b) {
+    const idA = String(a.id);
+    const idB = String(b.id);
+    return idA < idB
+      ? `pair:${idA}|${idB}`
+      : `pair:${idB}|${idA}`;
+  }
+
+  /**
+   * Construye una clave por emoción+intent (fallback legado).
+   * Solo se usa si no hay IDs disponibles.
+   */
+  static legacyKey(a, b) {
     const emoA = a.dominantEmotion || 'neutral';
     const emoB = b.dominantEmotion || 'neutral';
     const intA = a.dominantIntent || 'charla';
     const intB = b.dominantIntent || 'charla';
-
     const pair = [emoA + ':' + intA, emoB + ':' + intB].sort();
-    return `${pair[0]}|${pair[1]}`;
+    return `legacy:${pair[0]}|${pair[1]}`;
   }
 
   get(key) {
@@ -64,6 +84,10 @@ class DialogueCache {
     });
   }
 
+  invalidate(key) {
+    this.map.delete(key);
+  }
+
   clear() {
     this.map.clear();
   }
@@ -82,7 +106,8 @@ class DialogueCache {
 
 export const dialogueCache = new DialogueCache({
   maxSize: env.llmDialogueCacheSize,
-  ttlMs: env.llmDialogueCacheTtlMs,
+  // TTL por defecto más bajo: 15 min en vez de 2h
+  ttlMs: Math.min(env.llmDialogueCacheTtlMs, 900000),
 });
 
 export default dialogueCache;
