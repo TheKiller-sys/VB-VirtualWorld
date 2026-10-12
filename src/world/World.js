@@ -1,6 +1,13 @@
 // src/world/World.js
 // El mundo compartido. Contiene todas las entidades, el tick de simulación
 // y la lista de eventos recientes para broadcast.
+//
+// CAMBIOS V1.5.0:
+//   - [FIX] _applySingleEntityPhysics pasa `dt` a applyFriction
+//     (la nueva firma requiere delta time para calcular fricción per-second).
+//   - [FEAT] snapshotLight(): snapshot minimalista para broadcast a alta
+//     frecuencia. Solo incluye campos que cambian cada tick.
+//   - [FEAT] snapshot(): snapshot completo con todos los campos.
 
 import { Entity } from './Entity.js';
 import {
@@ -126,7 +133,7 @@ export class World {
       this._applySingleEntityPhysics(e, dt);
     }
 
-    // 2. Atracción/repulsión entre entidades (O(n²) — aceptable hasta ~500)
+    // 2. Atracción/repulsión entre entidades
     this._applyPairwiseForces(entities, dt);
 
     // 3. Interacciones
@@ -174,7 +181,7 @@ export class World {
 
   _applySingleEntityPhysics(entity, dt) {
     applyWander(entity, dt, this.wanderStrength);
-    applyFriction(entity, this.friction);
+    applyFriction(entity, this.friction, dt);
   }
 
   _applyPairwiseForces(entities, dt) {
@@ -249,7 +256,6 @@ export class World {
 
   /**
    * Drena los eventos acumulados (para broadcast).
-   * Devuelve un array y vacía el buffer.
    */
   drainEvents() {
     if (this.events.length === 0) return [];
@@ -259,7 +265,7 @@ export class World {
   }
 
   // ------------------------------------------------------------
-  // Relaciones agregadas (para el frontend)
+  // Relaciones agregadas
   // ------------------------------------------------------------
 
   getRelationshipLinks(minStrength = 0.15) {
@@ -289,9 +295,13 @@ export class World {
   }
 
   // ------------------------------------------------------------
-  // Snapshot para el frontend
+  // Snapshots
   // ------------------------------------------------------------
 
+  /**
+   * Snapshot COMPLETO. Contiene toda la info de cada entidad.
+   * Usado en welcome, cada N segundos, y on-demand.
+   */
   snapshot({ includeRelationships = true } = {}) {
     const entities = [];
     for (const e of this.entities.values()) {
@@ -317,13 +327,38 @@ export class World {
     return snap;
   }
 
+  /**
+   * Snapshot LIGERO. Solo campos que cambian cada tick.
+   * Usado para broadcasts de alta frecuencia (30Hz).
+   * Reduce el payload ~4x comparado con snapshot().
+   */
+  snapshotLight() {
+    const entities = [];
+    for (const e of this.entities.values()) {
+      if (e.dead) continue;
+      entities.push({
+        id: e.id,
+        x: round2(e.x),
+        y: round2(e.y),
+        vx: round2(e.vx),
+        vy: round2(e.vy),
+        a: round2(e.alpha),
+        p: round2(e.pulse),
+      });
+    }
+
+    return {
+      tick: this.tickCount,
+      entityCount: entities.length,
+      entities,
+      serverTime: Date.now(),
+    };
+  }
+
   // ------------------------------------------------------------
-  // Persistencia: import/export
+  // Persistencia
   // ------------------------------------------------------------
 
-  /**
-   * Devuelve el estado persistible completo (entidades + relaciones).
-   */
   toPersistable() {
     const entities = [];
     const relations = [];
@@ -343,10 +378,6 @@ export class World {
     return { entities, relations };
   }
 
-  /**
-   * Reconstruye el mundo desde filas persistidas.
-   * No dispara eventos.
-   */
   restoreFrom({ entities, relations }) {
     this.entities.clear();
     this.stats = { born: 0, died: 0, interactions: 0 };
@@ -374,9 +405,6 @@ export class World {
           interactionCount: row.interactionCount,
         };
         const e = new Entity(profile);
-        e.lastUpdatedAt = row.lastUpdatedAt || Date.now();
-        // Ojo: Entity constructor pisa lastUpdatedAt con Date.now().
-        // Lo restauramos después:
         this.entities.set(e.id, e);
       } catch (err) {
         // Ignorar filas corruptas
@@ -439,6 +467,7 @@ export class World {
 // ============================================================
 
 function round1(v) { return Math.round(v * 10) / 10; }
+function round2(v) { return Math.round(v * 100) / 100; }
 function round3(v) { return Math.round(v * 1000) / 1000; }
 function safeParse(str, def) {
   try { return JSON.parse(str); } catch { return def; }
