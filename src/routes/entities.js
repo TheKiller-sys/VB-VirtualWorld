@@ -1,19 +1,16 @@
 // src/routes/entities.js
-// Rutas de entidades + simulación.
+// Rutas de entidades + simulación + diálogos.
 //
-// CAMBIOS V1.1.0:
-//   - [SEC] Acepta ipQuota (inyectado desde server.js).
-//   - [SEC] Registra/desregistra IPs al crear/eliminar simuladas.
-//   - [FIX] Eliminada sanitización duplicada (la hace labelSanitizer en server.js).
-//   - [FIX] Validación de label coherente con server.js (más permisiva aquí,
-//           porque el server ya lo sanitizó antes).
-//   - [FIX] El guard de admin permite dev sin token (aviso en consola).
-//   - [FEAT] Los DELETE devuelven más info en la respuesta.
+// CAMBIOS V1.6.0:
+//   - [FEAT] GET /api/entities/:id/dialogues → todos los diálogos de la entidad
+//   - [FEAT] GET /api/entities/:id/dialogues/:otherId → diálogos entre dos
+//   - [FEAT] GET /api/entities/:id/relationships incluye lastDialogueAt
 
 import { Router } from 'express';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
+import { DialogueRepo } from '../persistence/repository.js';
 
 const log = logger.child('routes/entities');
 
@@ -22,9 +19,6 @@ const log = logger.child('routes/entities');
 // ============================================================
 
 function requireWorldAdmin(req, res, next) {
-  // En producción ya lo valida server.js al arrancar.
-  // Aquí solo aplicamos el check por request.
-
   if (!env.worldAdminToken) {
     if (env.isProd) {
       return res.status(503).json({
@@ -32,7 +26,7 @@ function requireWorldAdmin(req, res, next) {
         error: 'WORLD_ADMIN_TOKEN no configurado en producción',
       });
     }
-    return next(); // dev sin token
+    return next();
   }
 
   const token = req.headers['x-world-token'] || req.query.token;
@@ -62,8 +56,6 @@ function validateSimulateBody(body) {
     return { ok: false, error: 'Body debe ser un objeto' };
   }
 
-  // label — ya viene saneado por labelSanitizer del server.js.
-  // Aquí solo validamos tipo y longitud por defensa.
   if (body.label !== undefined && body.label !== null) {
     if (typeof body.label !== 'string') {
       errors.push('label debe ser string');
@@ -72,7 +64,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // emotion
   if (body.emotion !== undefined && body.emotion !== null) {
     const e = String(body.emotion).toLowerCase();
     if (!EMOTIONS.has(e)) {
@@ -82,7 +73,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // intent
   if (body.intent !== undefined && body.intent !== null) {
     if (typeof body.intent !== 'string') {
       errors.push('intent debe ser string');
@@ -91,7 +81,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // turnCount
   if (body.turnCount !== undefined && body.turnCount !== null) {
     const n = Number(body.turnCount);
     if (!Number.isFinite(n) || n < 0 || n > 100000) {
@@ -101,7 +90,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // sentiment
   if (body.sentiment !== undefined && body.sentiment !== null) {
     const n = Number(body.sentiment);
     if (!Number.isFinite(n) || n < -1 || n > 1) {
@@ -111,7 +99,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // intensity
   if (body.intensity !== undefined && body.intensity !== null) {
     const n = Number(body.intensity);
     if (!Number.isFinite(n) || n < 0 || n > 1) {
@@ -121,7 +108,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // topics
   if (body.topics !== undefined && body.topics !== null) {
     if (!Array.isArray(body.topics)) {
       errors.push('topics debe ser array');
@@ -130,7 +116,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // traits
   if (body.traits !== undefined && body.traits !== null) {
     if (typeof body.traits !== 'object' || Array.isArray(body.traits)) {
       errors.push('traits debe ser objeto');
@@ -149,7 +134,6 @@ function validateSimulateBody(body) {
     }
   }
 
-  // position (opcional)
   if (body.x !== undefined && body.x !== null) {
     const n = Number(body.x);
     if (Number.isFinite(n)) out.x = n;
@@ -176,7 +160,7 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
   // ------------------------------------------------------------
   router.get('/', (req, res) => {
     const limit = clampInt(req.query.limit, 500, 1, 2000);
-    const type = req.query.type; // 'real' | 'simulated' | undefined
+    const type = req.query.type;
 
     let entities = Array.from(world.entities.values())
       .filter(e => !e.dead);
@@ -222,6 +206,7 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
         label: other.label,
         x: round2(other.x),
         y: round2(other.y),
+        dialogueCount: safeCountDialogues(entity.id, otherId),
       });
     }
     relationships.sort((a, b) => b.strength - a.strength);
@@ -252,6 +237,7 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
         id: otherId,
         strength: round3(strength),
         other: other.toJSON(),
+        dialogueCount: safeCountDialogues(entity.id, otherId),
       });
     }
 
@@ -266,10 +252,73 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
   });
 
   // ------------------------------------------------------------
+  // GET /:id/dialogues
+  // Todos los diálogos donde participa la entidad.
+  // Query params:
+  //   - limit (default 50, max 200)
+  //   - with=otherId  → filtra solo diálogos con esa entidad
+  // ------------------------------------------------------------
+  router.get('/:id/dialogues', (req, res) => {
+    const id = String(req.params.id);
+    const entity = world.getEntity(id);
+
+    if (!entity) {
+      // La entidad puede haber muerto pero sus diálogos siguen en DB
+      // Solo advertimos, no bloqueamos
+    }
+
+    const limit = clampInt(req.query.limit, 50, 1, 200);
+    const withId = req.query.with ? String(req.query.with) : null;
+
+    try {
+      let dialogues;
+
+      if (withId) {
+        dialogues = DialogueRepo.listByPair(id, withId, limit);
+      } else {
+        dialogues = DialogueRepo.listByEntity(id, limit);
+      }
+
+      res.json({
+        success: true,
+        entityId: id,
+        withId: withId || null,
+        count: dialogues.length,
+        dialogues: dialogues.map(d => serializeDialogue(d, world, id)),
+      });
+    } catch (err) {
+      log.error(`GET /:id/dialogues falló: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // GET /:id/dialogues/:otherId
+  // Diálogos entre dos entidades específicas.
+  // ------------------------------------------------------------
+  router.get('/:id/dialogues/:otherId', (req, res) => {
+    const id = String(req.params.id);
+    const otherId = String(req.params.otherId);
+    const limit = clampInt(req.query.limit, 100, 1, 200);
+
+    try {
+      const dialogues = DialogueRepo.listByPair(id, otherId, limit);
+
+      res.json({
+        success: true,
+        entityId: id,
+        otherId,
+        count: dialogues.length,
+        dialogues: dialogues.map(d => serializeDialogue(d, world, id)),
+      });
+    } catch (err) {
+      log.error(`GET /:id/dialogues/:otherId falló: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ------------------------------------------------------------
   // POST /simulate
-  // Crea una entidad simulada.
-  // Los middlewares (rate, quota, global limit, sanitización) los aplica
-  // server.js ANTES de llegar aquí.
   // ------------------------------------------------------------
   router.post('/simulate', requireWorldAdmin, asyncHandler(async (req, res) => {
     const v = validateSimulateBody(req.body);
@@ -301,7 +350,6 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
     try {
       const { entity, created } = world.upsertEntity(profile);
 
-      // Registra la IP en la cuota SOLO si es creación nueva (no update)
       if (created && ipQuota) {
         ipQuota.register(ip, entity.id);
       }
@@ -311,7 +359,6 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
         `(${entity.dominantEmotion}/${entity.dominantIntent}) desde ${ip}`
       );
 
-      // Notifica por WS a todos
       wsServer.broadcast({
         type: 'entity_created',
         entity: entity.toJSON(),
@@ -336,7 +383,6 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
 
   // ------------------------------------------------------------
   // GET /simulate
-  // Lista de simuladas
   // ------------------------------------------------------------
   router.get('/simulate', (req, res) => {
     const list = Array.from(world.entities.values())
@@ -352,7 +398,6 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
 
   // ------------------------------------------------------------
   // DELETE /simulate/:id
-  // Elimina UNA simulada
   // ------------------------------------------------------------
   router.delete('/simulate/:id', requireWorldAdmin, (req, res) => {
     const id = String(req.params.id);
@@ -386,7 +431,6 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
 
   // ------------------------------------------------------------
   // DELETE /simulate
-  // Elimina TODAS las simuladas
   // ------------------------------------------------------------
   router.delete('/simulate', requireWorldAdmin, (req, res) => {
     const ids = [];
@@ -416,6 +460,48 @@ export function createEntitiesRouter({ world, wsServer, ipQuota }) {
 // ============================================================
 // Helpers
 // ============================================================
+
+function serializeDialogue(d, world, viewerId) {
+  const entityA = world.getEntity(d.aId);
+  const entityB = world.getEntity(d.bId);
+
+  return {
+    id: d.id,
+    source: d.source,
+    createdAt: d.createdAt,
+    startedAt: d.startedAt,
+    participants: {
+      a: entityA ? {
+        id: entityA.id,
+        label: entityA.label,
+        emotion: entityA.dominantEmotion,
+        color: entityA.color,
+      } : { id: d.aId, label: null, emotion: 'neutral', color: '#9aa3b2' },
+      b: entityB ? {
+        id: entityB.id,
+        label: entityB.label,
+        emotion: entityB.dominantEmotion,
+        color: entityB.color,
+      } : { id: d.bId, label: null, emotion: 'neutral', color: '#9aa3b2' },
+    },
+    messages: d.messages.map(m => ({
+      entityId: m.entityId,
+      text: m.text,
+      delayMs: m.delayMs,
+      durationMs: m.durationMs,
+      // Marca quién habla respecto al viewer
+      side: m.entityId === viewerId ? 'self' : 'other',
+    })),
+  };
+}
+
+function safeCountDialogues(aId, bId) {
+  try {
+    return DialogueRepo.listByPair(aId, bId, 200).length;
+  } catch (_) {
+    return 0;
+  }
+}
 
 function generateSimId() {
   const t = Date.now().toString(36);
