@@ -10,7 +10,7 @@ services:
       - NODE_ENV=production
       - BFF_PORT=5000
       - BFF_HOST=0.0.0.0
-      - CEREBRO_URL=http://cerebro-digital:3000
+      - CEREBRO_URL=179.236.69.213:3000
       - CEREBRO_ADMIN_TOKEN=${CEREBRO_ADMIN_TOKEN}
       - WORLD_ADMIN_TOKEN=${WORLD_ADMIN_TOKEN}
       - WORLD_DB_PATH=/app/data/world.db
